@@ -16,6 +16,7 @@ const allowedOrigins = [
   "http://localhost:8082",
   "http://localhost:19006",
   "http://localhost:8000",
+  "https://gravly-backend-api.onrender.com",
   "https://gravly-backend.onrender.com",
   process.env.CLIENT_URL,
 ].filter(Boolean) as string[];

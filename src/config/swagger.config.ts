@@ -15,7 +15,7 @@ export const swaggerSpec = swaggerJsdoc({
     },
     servers: [
       {
-        url: "https://gravly-backend.onrender.com/api/v1",
+        url: "https://gravly-backend-api.onrender.com/api/v1",
         description: "API v1",
       },
     ],
