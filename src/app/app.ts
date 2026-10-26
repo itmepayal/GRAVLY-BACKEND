@@ -15,10 +15,7 @@ const allowedOrigins = [
   "http://localhost:8081",
   "http://localhost:19006",
   "http://localhost:8000",
-  "http://127.0.0.1:5500",
-  "https://cafe-6icu.onrender.com",
-  "https://cafe-myg2.onrender.com",
-  "https://gravity-task-management-system.vercel.app",
+  "https://gravly-backend.onrender.com",
   process.env.CLIENT_URL,
 ].filter(Boolean) as string[];
 
