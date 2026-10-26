@@ -48,6 +48,9 @@ const VISIBLE_TO_CAFE = {
 
 const PHONE = /^[6-9]\d{9}$/;
 
+/* flat platform fee added to every order (in rupees) */
+const PLATFORM_FEE = 10;
+
 /* =====================================================
    HELPERS
 ===================================================== */
@@ -267,7 +270,7 @@ export const placeOrderService = async (studentId: string) => {
   const subtotal = orderItems.reduce((s, i) => s + i.price * i.quantity, 0);
   const deliveryFee =
     cart.orderMethod === "delivery" ? (cafe.deliveryFee ?? 0) : 0;
-  const platformFee = cafe.platformFee ?? 0;
+  const platformFee = PLATFORM_FEE;
   const totalAmount = subtotal + deliveryFee + platformFee;
 
   const claimed = await Cart.findOneAndUpdate(
