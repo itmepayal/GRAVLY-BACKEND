@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { serverConfig } from ".";
+import { serverConfig } from "./index.js";
 
 export const CASHFREE_BASE_URL =
   serverConfig.CASHFREE_ENV === "PRODUCTION"

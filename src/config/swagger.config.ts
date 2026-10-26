@@ -1,5 +1,8 @@
 import path from "path";
+import { fileURLToPath } from "url";
 import swaggerJsdoc from "swagger-jsdoc";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const swaggerSpec = swaggerJsdoc({
   definition: {

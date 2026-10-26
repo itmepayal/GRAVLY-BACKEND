@@ -1,13 +1,13 @@
 import { HydratedDocument, Types } from "mongoose";
 
-import { Cart, ICart } from "../models/cart.model";
-import { Cafe } from "../models/cafe.model";
-import { MenuItem, IMenuItem } from "../models/menuItem.model";
+import { Cart, ICart } from "../models/cart.model.js";
+import { Cafe } from "../models/cafe.model.js";
+import { MenuItem, IMenuItem } from "../models/menuItem.model.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
-} from "../utils/errors/app.error";
+} from "../utils/errors/app.error.js";
 
 /* =====================================================
    TYPES

@@ -8,9 +8,9 @@ import {
   updateMenuStockService,
   deleteMenuItemService,
   setMenuStockStatusService,
-} from "../service/menu.service";
-import type { UploadedFiles } from "../service/cafe.service";
-import { BadRequestError } from "../utils/errors/app.error";
+} from "../service/menu.service.js";
+import type { UploadedFiles } from "../service/cafe.service.js";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 const getUserId = (req: Request): string => {
   const id = req.user?._id;

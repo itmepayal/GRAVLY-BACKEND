@@ -1,6 +1,5 @@
-// src/models/menu.model.ts
 import { Schema, model, Document, Types } from "mongoose";
-import { ICafe, IFile } from "./cafe.model";
+import { ICafe, IFile } from "./cafe.model.js";
 
 export interface IMenuItem extends Document {
   cafe: Types.ObjectId | ICafe;

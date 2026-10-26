@@ -1,12 +1,12 @@
 import express from "express";
 
-import authRoutes from "./auth.router";
-import cafeRoutes from "./cafe.router";
-import menuRoutes from "./menu.router";
-import cartRoutes from "./cart.router";
-import orderRoutes from "./order.router";
-import paymentRoutes from "./payment.router";
-import adminRoutes from "./admin.router";
+import authRoutes from "./auth.router.js";
+import cafeRoutes from "./cafe.router.js";
+import menuRoutes from "./menu.router.js";
+import cartRoutes from "./cart.router.js";
+import orderRoutes from "./order.router.js";
+import paymentRoutes from "./payment.router.js";
+import adminRoutes from "./admin.router.js";
 
 const v1Router = express.Router();
 

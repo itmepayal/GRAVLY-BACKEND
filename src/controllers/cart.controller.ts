@@ -8,9 +8,9 @@ import {
   removeCartItemService,
   clearCartService,
   updateCartOptionsService,
-} from "../service/cart.service";
+} from "../service/cart.service.js";
 
-import { BadRequestError } from "../utils/errors/app.error";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 /* =====================================================
    HELPERS

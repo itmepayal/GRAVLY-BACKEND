@@ -2,7 +2,7 @@ import { Router } from "express";
 import {
   authenticate,
   authorize,
-} from "../../middlewares/authenticate.middleware";
+} from "../../middlewares/authenticate.middleware.js";
 
 import {
   getDashboardOverview,
@@ -16,7 +16,7 @@ import {
   getAdminProfile,
   updateAdminProfile,
   changeAdminPassword,
-} from "../../controllers/admin.controller";
+} from "../../controllers/admin.controller.js";
 
 const router = Router();
 

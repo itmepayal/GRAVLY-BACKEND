@@ -1,9 +1,9 @@
 import type { Server } from "http";
 
-import { connectDB } from "./config/db.config";
-import logger from "./config/logger.config";
-import { serverConfig } from "./config";
-import createApp from "./app/app";
+import { connectDB } from "./config/db.config.js";
+import logger from "./config/logger.config.js";
+import { serverConfig } from "./config/index.js";
+import createApp from "./app/app.js";
 
 let httpServer: Server | undefined;
 let isShuttingDown = false;

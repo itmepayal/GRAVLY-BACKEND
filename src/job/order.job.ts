@@ -1,7 +1,7 @@
-import { Order } from "../models/order.model";
-import { Payment } from "../models/payment.model";
-import { releaseStock } from "../service/order.service";
-import { syncLatestPayment } from "../service/payment.service";
+import { Order } from "../models/order.model.js";
+import { Payment } from "../models/payment.model.js";
+import { releaseStock } from "../service/order.service.js";
+import { syncLatestPayment } from "../service/payment.service.js";
 
 /* =====================================================
    CANCEL UNPAID ONLINE ORDERS

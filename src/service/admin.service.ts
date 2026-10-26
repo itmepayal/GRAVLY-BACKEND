@@ -1,14 +1,14 @@
 import { Types } from "mongoose";
 import bcrypt from "bcryptjs";
 
-import { User } from "../models/user.model";
-import { Student } from "../models/student.model";
-import { Cafe } from "../models/cafe.model";
-import { Order } from "../models/order.model";
-import { Payment } from "../models/payment.model";
-import { RefreshToken } from "../models/refreshToken.model";
+import { User } from "../models/user.model.js";
+import { Student } from "../models/student.model.js";
+import { Cafe } from "../models/cafe.model.js";
+import { Order } from "../models/order.model.js";
+import { Payment } from "../models/payment.model.js";
+import { RefreshToken } from "../models/refreshToken.model.js";
 
-import { BadRequestError, NotFoundError } from "../utils/errors/app.error";
+import { BadRequestError, NotFoundError } from "../utils/errors/app.error.js";
 
 /* =========================================================
    CONSTANTS

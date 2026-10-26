@@ -4,12 +4,12 @@ import {
   initiatePayment,
   getPaymentStatus,
   cashfreeWebhook,
-} from "../../controllers/payment.controller";
+} from "../../controllers/payment.controller.js";
 
 import {
   authenticate,
   authorize,
-} from "../../middlewares/authenticate.middleware";
+} from "../../middlewares/authenticate.middleware.js";
 
 const STUDENT = "student";
 

@@ -3,9 +3,9 @@ import dotenv from "dotenv";
 import { v2 as cloudinary } from "cloudinary";
 import type { UploadApiOptions, UploadApiResponse } from "cloudinary";
 
-import { serverConfig } from ".";
-import { BadRequestError } from "../utils/errors/app.error";
-import { logger } from "./logger.config";
+import { serverConfig } from "./index.js";
+import { BadRequestError } from "../utils/errors/app.error.js";
+import { logger } from "./logger.config.js";
 
 dotenv.config();
 

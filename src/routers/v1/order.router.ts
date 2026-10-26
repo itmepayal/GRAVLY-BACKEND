@@ -12,12 +12,12 @@ import {
   acceptOrder,
   rejectOrder,
   updateOrderStatus,
-} from "../../controllers/order.controller";
+} from "../../controllers/order.controller.js";
 
 import {
   authenticate,
   authorize,
-} from "../../middlewares/authenticate.middleware";
+} from "../../middlewares/authenticate.middleware.js";
 
 const STUDENT = "student";
 const CAFE_OWNER = "cafeOwner";

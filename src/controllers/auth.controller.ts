@@ -9,9 +9,9 @@ import {
   appleStudentLoginService,
   googleCafeOwnerLoginService,
   appleCafeOwnerLoginService,
-} from "../service/auth.service";
+} from "../service/auth.service.js";
 
-import { BadRequestError } from "../utils/errors/app.error";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 /* =====================================================
    TYPES

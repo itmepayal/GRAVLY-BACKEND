@@ -2,13 +2,13 @@ import express from "express";
 import cors, { CorsOptions } from "cors";
 import swaggerUi from "swagger-ui-express";
 import mongoose from "mongoose";
-import logger from "../config/logger.config";
-import { swaggerSpec } from "../config/swagger.config";
-import v1Router from "../routers/v1/index.router";
+import logger from "../config/logger.config.js";
+import { swaggerSpec } from "../config/swagger.config.js";
+import v1Router from "../routers/v1/index.router.js";
 import {
   appErrorHandler,
   genericErrorHandler,
-} from "../middlewares/error.middleware";
+} from "../middlewares/error.middleware.js";
 
 const allowedOrigins = [
   "http://localhost:3000",

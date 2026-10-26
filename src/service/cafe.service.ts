@@ -1,21 +1,21 @@
 import crypto from "crypto";
 import { Types } from "mongoose";
 
-import { Cafe, IFile } from "../models/cafe.model";
+import { Cafe, IFile } from "../models/cafe.model.js";
 
 import {
   uploadImage,
   signedUrl,
   type CloudinaryFile,
   type CloudinaryUploadResult,
-} from "../config/cloudinary.config";
+} from "../config/cloudinary.config.js";
 
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
-} from "../utils/errors/app.error";
-import { MenuItem } from "../models/menuItem.model";
+} from "../utils/errors/app.error.js";
+import { MenuItem } from "../models/menuItem.model.js";
 
 /* =====================================================
    TYPES

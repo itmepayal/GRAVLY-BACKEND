@@ -14,9 +14,9 @@ import {
   approveCafeService,
   rejectCafeService,
   type UploadedFiles,
-} from "../service/cafe.service";
+} from "../service/cafe.service.js";
 
-import { BadRequestError } from "../utils/errors/app.error";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 /* =====================================================
    HELPERS

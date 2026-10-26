@@ -4,15 +4,15 @@ import jwt from "jsonwebtoken";
 import { OAuth2Client } from "google-auth-library";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-import { User, IUser } from "../models/user.model";
-import { Student } from "../models/student.model";
-import { RefreshToken } from "../models/refreshToken.model";
+import { User, IUser } from "../models/user.model.js";
+import { Student } from "../models/student.model.js";
+import { RefreshToken } from "../models/refreshToken.model.js";
 
 import {
   generateTokens,
   verifyRefreshToken,
   TokenPair,
-} from "../utils/jwt/jwt";
+} from "../utils/jwt/jwt.js";
 
 import {
   BadRequestError,
@@ -20,9 +20,9 @@ import {
   ForbiddenError,
   InternalServerError,
   UnauthorizedError,
-} from "../utils/errors/app.error";
+} from "../utils/errors/app.error.js";
 
-import { serverConfig } from "../config";
+import { serverConfig } from "../config/index.js";
 
 /* =====================================================
    GOOGLE & APPLE CONFIGURATION

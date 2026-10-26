@@ -13,10 +13,10 @@ import {
   acceptOrderService,
   rejectOrderService,
   updateOrderStatusService,
-} from "../service/order.service";
+} from "../service/order.service.js";
 
-import { BadRequestError } from "../utils/errors/app.error";
-import { cafeIdOf } from "../utils/order/requestUser";
+import { BadRequestError } from "../utils/errors/app.error.js";
+import { cafeIdOf } from "../utils/order/requestUser.js";
 
 /* =====================================================
    HELPERS

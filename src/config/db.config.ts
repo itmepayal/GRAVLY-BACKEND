@@ -1,8 +1,8 @@
 import mongoose from "mongoose";
 import "dotenv/config";
 
-import { serverConfig } from ".";
-import logger from "./logger.config";
+import { serverConfig } from "./index.js";
+import logger from "./logger.config.js";
 
 const MONGO_URL = serverConfig.MONGODB_URI;
 

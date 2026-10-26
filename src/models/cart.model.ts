@@ -1,7 +1,7 @@
 import { Schema, model, Document, Types } from "mongoose";
-import { IStudent } from "./student.model";
-import { ICafe } from "./cafe.model";
-import { IMenuItem } from "./menuItem.model";
+import { IStudent } from "./student.model.js";
+import { ICafe } from "./cafe.model.js";
+import { IMenuItem } from "./menuItem.model.js";
 
 export interface ICartItem {
   menuItem: Types.ObjectId | IMenuItem;

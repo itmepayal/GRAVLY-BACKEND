@@ -6,7 +6,7 @@ import type {
   ErrorRequestHandler,
 } from "express";
 
-import { BadRequestError } from "../utils/errors/app.error";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 /* =====================================================
    CONFIG

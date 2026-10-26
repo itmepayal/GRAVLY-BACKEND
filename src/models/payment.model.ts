@@ -1,7 +1,7 @@
 import { Schema, model, Document, Types } from "mongoose";
-import { IOrder } from "./order.model";
-import { IStudent } from "./student.model";
-import { ICafe } from "./cafe.model";
+import { IOrder } from "./order.model.js";
+import { IStudent } from "./student.model.js";
+import { ICafe } from "./cafe.model.js";
 
 export interface IPayment extends Document {
   paymentId: string;

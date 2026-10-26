@@ -1,17 +1,17 @@
 import { randomBytes } from "crypto";
 import { HydratedDocument, Types } from "mongoose";
 
-import { Cart } from "../models/cart.model";
-import { Cafe } from "../models/cafe.model";
-import { MenuItem, IMenuItem } from "../models/menuItem.model";
-import { Order, IOrder, OrderStatus } from "../models/order.model";
-import { Payment } from "../models/payment.model";
-import { refundOrderPayment, recordCashPayment } from "./payment.service";
+import { Cart } from "../models/cart.model.js";
+import { Cafe } from "../models/cafe.model.js";
+import { MenuItem, IMenuItem } from "../models/menuItem.model.js";
+import { Order, IOrder, OrderStatus } from "../models/order.model.js";
+import { Payment } from "../models/payment.model.js";
+import { refundOrderPayment, recordCashPayment } from "./payment.service.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
-} from "../utils/errors/app.error";
+} from "../utils/errors/app.error.js";
 
 /* =====================================================
    TYPES + CONSTANTS

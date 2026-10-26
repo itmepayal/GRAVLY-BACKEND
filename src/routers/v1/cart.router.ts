@@ -7,12 +7,12 @@ import {
   removeCartItem,
   clearCart,
   updateCartOptions,
-} from "../../controllers/cart.controller";
+} from "../../controllers/cart.controller.js";
 
 import {
   authenticate,
   authorize,
-} from "../../middlewares/authenticate.middleware";
+} from "../../middlewares/authenticate.middleware.js";
 
 const router = Router();
 

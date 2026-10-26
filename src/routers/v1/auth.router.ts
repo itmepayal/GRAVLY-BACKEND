@@ -9,8 +9,8 @@ import {
   appleLogin,
   cafeOwnerGoogleLogin,
   cafeOwnerAppleLogin,
-} from "../../controllers/auth.controller";
-import { authenticate } from "../../middlewares/authenticate.middleware";
+} from "../../controllers/auth.controller.js";
+import { authenticate } from "../../middlewares/authenticate.middleware.js";
 
 const router = Router();
 

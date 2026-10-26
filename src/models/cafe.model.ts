@@ -1,6 +1,6 @@
 // src/models/cafe.model.ts
 import { Schema, model, Document, Types } from "mongoose";
-import { IUser } from "./user.model";
+import { IUser } from "./user.model.js";
 
 /* =====================================================
    TYPES

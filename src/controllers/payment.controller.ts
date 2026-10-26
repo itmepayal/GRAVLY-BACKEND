@@ -5,9 +5,9 @@ import {
   initiatePaymentService,
   getPaymentStatusService,
   handleCashfreeWebhookService,
-} from "../service/payment.service";
+} from "../service/payment.service.js";
 
-import { BadRequestError } from "../utils/errors/app.error";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 /* =====================================================
    HELPERS

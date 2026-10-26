@@ -2,10 +2,11 @@
   "name": "expresstypescripttemplate",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "nodemon src/server.ts",
+    "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
@@ -13,18 +14,20 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@types/node": "^22.20.5",
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.11.0",
     "cors": "^2.8.6",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "google-auth-library": "^10.9.1",
-    "jose": "^6.2.13",
+    "jose": "^4.15.9",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.11.4",
     "multer": "^2.5.0",
     "swagger-jsdoc": "^6.3.0",
     "swagger-ui-express": "^5.0.1",
+    "typescript": "^5.9.3",
     "uuid": "^11.1.0",
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0",
@@ -35,11 +38,10 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.3.0",
-    "@types/node": "^22.14.0",
     "@types/swagger-jsdoc": "^6.0.4",
     "@types/swagger-ui-express": "^4.1.8",
     "nodemon": "^3.1.9",
     "ts-node": "^10.9.2",
-    "typescript": "^5.8.3"
+    "tsx": "^4.23.15"
   }
 }

@@ -1,6 +1,6 @@
 import jwt, { SignOptions } from "jsonwebtoken";
-import type { UserRole } from "../../models/user.model";
-import { serverConfig } from "../../config";
+import type { UserRole } from "../../models/user.model.js";
+import { serverConfig } from "../../config/index.js";
 
 export type Role = UserRole;
 

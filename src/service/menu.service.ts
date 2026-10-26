@@ -1,13 +1,16 @@
 import { Types } from "mongoose";
 
-import { Cafe } from "../models/cafe.model";
-import { MenuItem } from "../models/menuItem.model";
-import { uploadImage, type CloudinaryFile } from "../config/cloudinary.config";
+import { Cafe } from "../models/cafe.model.js";
+import { MenuItem } from "../models/menuItem.model.js";
+import {
+  uploadImage,
+  type CloudinaryFile,
+} from "../config/cloudinary.config.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
-} from "../utils/errors/app.error";
+} from "../utils/errors/app.error.js";
 
 /* =====================================================
    HELPERS

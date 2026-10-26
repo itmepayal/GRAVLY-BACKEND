@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction, RequestHandler } from "express";
 
-import { User, IUser, UserRole } from "../models/user.model";
-import { verifyAccessToken } from "../utils/jwt/jwt";
+import { User, IUser, UserRole } from "../models/user.model.js";
+import { verifyAccessToken } from "../utils/jwt/jwt.js";
 
 export const ROLE_RANK: Record<UserRole, number> = {
   student: 1,

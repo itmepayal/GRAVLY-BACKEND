@@ -1,21 +1,21 @@
 import { randomBytes } from "crypto";
 import { HydratedDocument, Types } from "mongoose";
 
-import { Payment, IPayment } from "../models/payment.model";
-import { Order, IOrder } from "../models/order.model";
-import { Student } from "../models/student.model";
-import { serverConfig } from "../config";
+import { Payment, IPayment } from "../models/payment.model.js";
+import { Order, IOrder } from "../models/order.model.js";
+import { Student } from "../models/student.model.js";
+import { serverConfig } from "../config/index.js";
 import {
   createCashfreeOrder,
   verifyCashfreeOrder,
   verifyCashfreeWebhookSignature,
   createCashfreeRefund,
-} from "../config/cashfree.config";
+} from "../config/cashfree.config.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
-} from "../utils/errors/app.error";
+} from "../utils/errors/app.error.js";
 
 /* =====================================================
    TYPES + HELPERS

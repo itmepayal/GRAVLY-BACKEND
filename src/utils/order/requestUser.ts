@@ -1,7 +1,7 @@
 import { Request } from "express";
 
-import { Cafe } from "../../models/cafe.model";
-import { BadRequestError, NotFoundError } from "../errors/app.error";
+import { Cafe } from "../../models/cafe.model.js";
+import { BadRequestError, NotFoundError } from "../errors/app.error.js";
 
 type AuthUser = { id?: string; _id?: string; userId?: string; role?: string };
 

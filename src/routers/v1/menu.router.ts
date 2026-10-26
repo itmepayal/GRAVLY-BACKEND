@@ -8,13 +8,13 @@ import {
   updateMenuStock,
   deleteMenuItem,
   setMenuStockStatus,
-} from "../../controllers/menu.controller";
+} from "../../controllers/menu.controller.js";
 
 import {
   authenticate,
   authorize,
-} from "../../middlewares/authenticate.middleware";
-import { upload } from "../../middlewares/upload.middleware";
+} from "../../middlewares/authenticate.middleware.js";
+import { upload } from "../../middlewares/upload.middleware.js";
 
 const router = Router();
 

@@ -1,6 +1,6 @@
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 
-import { BadRequestError } from "../utils/errors/app.error";
+import { BadRequestError } from "../utils/errors/app.error.js";
 
 import {
   getDashboardOverviewService,
@@ -14,7 +14,7 @@ import {
   getAdminProfileService,
   updateAdminProfileService,
   changeAdminPasswordService,
-} from "../service/admin.service";
+} from "../service/admin.service.js";
 
 /* =========================================================
    TYPES
