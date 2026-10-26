@@ -13,7 +13,12 @@ export const swaggerSpec = swaggerJsdoc({
       description:
         "APIs for Student, Cafe Owner and a single Admin (authentication, cafe management and menu management).",
     },
-    servers: [{ url: "http://localhost:8000/api/v1", description: "API v1" }],
+    servers: [
+      {
+        url: "https://gravly-backend.onrender.com/api/v1",
+        description: "API v1",
+      },
+    ],
     tags: [
       {
         name: "Authentication",
