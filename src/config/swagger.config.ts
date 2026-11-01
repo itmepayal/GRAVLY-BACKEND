@@ -1,6 +1,7 @@
 import path from "path";
 import { fileURLToPath } from "url";
 import swaggerJsdoc from "swagger-jsdoc";
+import { serverConfig } from "./index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -15,7 +16,10 @@ export const swaggerSpec = swaggerJsdoc({
     },
     servers: [
       {
-        url: "https://gravly-backend-api.onrender.com/api/v1",
+        url:
+          serverConfig.NODE_ENV == "development"
+            ? "http://localhost:8000/api/v1"
+            : "https://gravly-backend-api.onrender.com/api/v1",
         description: "API v1",
       },
     ],

@@ -1,8 +1,8 @@
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
-import { OAuth2Client } from "google-auth-library";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { getApps, initializeApp, cert } from "firebase-admin/app";
+import { getAuth, DecodedIdToken } from "firebase-admin/auth";
 
 import { User, IUser } from "../models/user.model.js";
 import { Student } from "../models/student.model.js";
@@ -21,18 +21,28 @@ import {
   InternalServerError,
   UnauthorizedError,
 } from "../utils/errors/app.error.js";
-
 import { serverConfig } from "../config/index.js";
 
 /* =====================================================
-   GOOGLE & APPLE CONFIGURATION
+   FIREBASE CONFIGURATION
 ===================================================== */
+const getFirebaseAuth = () => {
+  if (getApps().length === 0) {
+    const projectId = serverConfig.FIREBASE_PROJECT_ID;
+    const clientEmail = serverConfig.FIREBASE_CLIENT_EMAIL;
+    const privateKey = serverConfig.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
-const googleClient = new OAuth2Client();
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new InternalServerError("Social login not configured");
+    }
 
-const APPLE_JWKS = createRemoteJWKSet(
-  new URL("https://appleid.apple.com/auth/keys"),
-);
+    initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+  }
+
+  return getAuth();
+};
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -77,22 +87,6 @@ const safeEqual = (a: string, b: string): boolean => {
   }
 
   return crypto.timingSafeEqual(bufA, bufB);
-};
-
-const parseIds = (
-  value: string | undefined,
-  errorMessage: string,
-): string[] => {
-  const ids = (value || "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean);
-
-  if (ids.length === 0) {
-    throw new InternalServerError(errorMessage);
-  }
-
-  return ids;
 };
 
 const toDuplicateKeyError = (error: unknown, message: string): unknown => {
@@ -157,7 +151,7 @@ export const adminRegisterService = async (
   password: string,
   secret: string,
 ): Promise<AuthResult> => {
-  const expectedSecret = process.env.ADMIN_REGISTER_SECRET;
+  const expectedSecret = serverConfig.ADMIN_REGISTER_SECRET;
 
   if (!expectedSecret) {
     throw new InternalServerError("Admin registration not configured");
@@ -332,99 +326,53 @@ export const logoutService = async (refreshToken: string): Promise<void> => {
 };
 
 /* =====================================================
-   GOOGLE TOKEN VERIFICATION
+   FIREBASE TOKEN VERIFICATION (GOOGLE + APPLE)
 ===================================================== */
-
-const verifyGoogleToken = async (idToken: string): Promise<SocialProfile> => {
-  if (typeof idToken !== "string" || !idToken) {
-    throw new BadRequestError("Google ID token is required");
-  }
-
-  const audiences = parseIds(
-    serverConfig.GOOGLE_CLIENT_ID,
-    "Google login not configured",
-  );
-
-  let payload;
-
-  try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken,
-      audience: audiences,
-    });
-
-    payload = ticket.getPayload();
-  } catch {
-    throw new UnauthorizedError("Invalid Google token");
-  }
-
-  if (!payload?.sub || !payload.email || !payload.email_verified) {
-    throw new UnauthorizedError("Invalid Google account");
-  }
-
-  return {
-    provider: "google",
-    providerId: payload.sub,
-    email: payload.email.trim().toLowerCase(),
-    emailVerified: true,
-    name: payload.name,
-    picture: payload.picture,
-  };
-};
-
-/* =====================================================
-   APPLE TOKEN VERIFICATION
-===================================================== */
-
-const verifyAppleToken = async (
-  identityToken: string,
+const verifyFirebaseToken = async (
+  idToken: string,
+  expectedProvider: SocialProvider,
   fullName?: string,
 ): Promise<SocialProfile> => {
-  if (typeof identityToken !== "string" || !identityToken) {
-    throw new BadRequestError("Apple identity token is required");
+  if (typeof idToken !== "string" || !idToken) {
+    throw new BadRequestError("ID token is required");
   }
 
-  const audiences = parseIds(
-    serverConfig.APPLE_CLIENT_ID,
-    "Apple login not configured",
-  );
+  const firebaseAuth = getFirebaseAuth();
 
-  let payload;
+  let decoded: DecodedIdToken;
 
   try {
-    ({ payload } = await jwtVerify(identityToken, APPLE_JWKS, {
-      issuer: "https://appleid.apple.com",
-      audience: audiences,
-    }));
+    decoded = await firebaseAuth.verifyIdToken(idToken);
   } catch {
-    throw new UnauthorizedError("Invalid Apple token");
+    throw new UnauthorizedError("Invalid token");
   }
 
-  if (!payload.sub) {
-    throw new UnauthorizedError("Invalid Apple account");
+  const firebaseProvider = decoded.firebase?.sign_in_provider;
+  const expected = expectedProvider === "google" ? "google.com" : "apple.com";
+
+  if (firebaseProvider !== expected) {
+    throw new UnauthorizedError("Token provider mismatch");
   }
 
-  const email =
-    typeof payload.email === "string"
-      ? payload.email.trim().toLowerCase()
-      : undefined;
+  const identityIds = decoded.firebase?.identities?.[expected] as
+    | string[]
+    | undefined;
 
-  const emailVerified =
-    payload.email_verified === true || payload.email_verified === "true";
+  const providerId = identityIds?.[0] ?? decoded.uid;
 
   return {
-    provider: "apple",
-    providerId: payload.sub,
-    email,
-    emailVerified,
-    name: fullName?.trim() || undefined,
+    provider: expectedProvider,
+    providerId: String(providerId),
+    email: decoded.email?.trim().toLowerCase(),
+    emailVerified: decoded.email_verified === true,
+    name: decoded.name || fullName?.trim() || undefined,
+    picture: decoded.picture,
   };
 };
 
 /* =====================================================
    SOCIAL LOGIN VALIDATION
 ===================================================== */
-
 const assertUserAllowed = (user: IUser, expectedRole: SocialRole): void => {
   if (user.role !== expectedRole) {
     throw new ForbiddenError("Please use the correct login for your account");
@@ -583,7 +531,7 @@ const socialLogin = async (
 export const googleStudentLoginService = async (
   idToken: string,
 ): Promise<AuthResult> => {
-  const profile = await verifyGoogleToken(idToken);
+  const profile = await verifyFirebaseToken(idToken, "google");
 
   return socialLogin(profile, "student");
 };
@@ -596,7 +544,7 @@ export const appleStudentLoginService = async (
   identityToken: string,
   fullName?: string,
 ): Promise<AuthResult> => {
-  const profile = await verifyAppleToken(identityToken, fullName);
+  const profile = await verifyFirebaseToken(identityToken, "apple", fullName);
 
   return socialLogin(profile, "student");
 };
@@ -608,7 +556,7 @@ export const appleStudentLoginService = async (
 export const googleCafeOwnerLoginService = async (
   idToken: string,
 ): Promise<AuthResult> => {
-  const profile = await verifyGoogleToken(idToken);
+  const profile = await verifyFirebaseToken(idToken, "google");
 
   return socialLogin(profile, "cafeOwner");
 };
@@ -620,7 +568,7 @@ export const appleCafeOwnerLoginService = async (
   identityToken: string,
   fullName?: string,
 ): Promise<AuthResult> => {
-  const profile = await verifyAppleToken(identityToken, fullName);
+  const profile = await verifyFirebaseToken(identityToken, "apple", fullName);
 
   return socialLogin(profile, "cafeOwner");
 };

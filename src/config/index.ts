@@ -48,6 +48,11 @@ type ServerConfig = {
 
   // Admin
   ADMIN_REGISTER_SECRET: string;
+
+  // Firebase
+  FIREBASE_PROJECT_ID: string;
+  FIREBASE_CLIENT_EMAIL: string;
+  FIREBASE_PRIVATE_KEY: string;
 };
 
 function getEnv(key: string): string {
@@ -113,4 +118,9 @@ export const serverConfig: ServerConfig = {
 
   // Admin
   ADMIN_REGISTER_SECRET: getEnv("ADMIN_REGISTER_SECRET"),
+
+  // Firebase
+  FIREBASE_PROJECT_ID: getEnv("FIREBASE_PROJECT_ID"),
+  FIREBASE_CLIENT_EMAIL: getEnv("FIREBASE_CLIENT_EMAIL"),
+  FIREBASE_PRIVATE_KEY: getEnv("FIREBASE_PRIVATE_KEY"),
 };
