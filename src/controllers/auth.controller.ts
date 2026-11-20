@@ -36,6 +36,8 @@ interface AuthResult {
   user: AuthenticatedUser;
   token: string;
   refreshToken: string;
+  isApproved?: boolean;
+  approvalStatus?: string;
 }
 
 /* =====================================================
@@ -113,6 +115,10 @@ const sendAuthSuccess = (
       accessToken: result.token,
       refreshToken: result.refreshToken,
       tokenType: "Bearer",
+      ...(result.isApproved !== undefined && { isApproved: result.isApproved }),
+      ...(result.approvalStatus !== undefined && {
+        approvalStatus: result.approvalStatus,
+      }),
       user: getUserResponse(result.user),
     },
   });

@@ -6,6 +6,7 @@ import { getAuth, DecodedIdToken } from "firebase-admin/auth";
 
 import { User, IUser } from "../models/user.model.js";
 import { Student } from "../models/student.model.js";
+import { Cafe, CafeApprovalStatus } from "../models/cafe.model.js";
 import { RefreshToken } from "../models/refreshToken.model.js";
 
 import {
@@ -66,6 +67,8 @@ export interface AuthResult {
   user: IUser;
   token: string;
   refreshToken: string;
+  isApproved?: boolean;
+  approvalStatus?: CafeApprovalStatus;
 }
 
 /* =====================================================
@@ -521,7 +524,21 @@ const socialLogin = async (
     );
   }
 
-  return buildAuthResult(user as IUser);
+  const authResult = await buildAuthResult(user as IUser);
+
+  if (expectedRole === "cafeOwner") {
+    const cafe = await Cafe.findOne({
+      owner: user._id,
+    }).select("isApproved approvalStatus");
+
+    return {
+      ...authResult,
+      isApproved: cafe?.isApproved ?? false,
+      approvalStatus: cafe?.approvalStatus ?? "pending",
+    };
+  }
+
+  return authResult;
 };
 
 /* =====================================================
