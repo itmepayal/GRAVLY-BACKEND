@@ -1,3 +1,4 @@
+import { randomBytes } from "crypto";
 import { Schema, model, Document, Types } from "mongoose";
 import { IStudent } from "./student.model.js";
 import { ICafe } from "./cafe.model.js";
@@ -129,12 +130,26 @@ const orderSchema = new Schema<IOrder>(
 );
 
 orderSchema.index({ student: 1, createdAt: -1 });
+orderSchema.index({ student: 1, status: 1, createdAt: -1 });
 orderSchema.index({ cafe: 1, status: 1, createdAt: -1 });
+orderSchema.index({ cafe: 1, status: 1, completedAt: -1 });
+orderSchema.index({ createdAt: -1, _id: -1 });
+orderSchema.index({ status: 1, createdAt: -1, _id: -1 });
+orderSchema.index(
+  { createdAt: 1 },
+  {
+    partialFilterExpression: {
+      status: "pending",
+      paymentMethod: "online",
+      paymentStatus: "pending",
+    },
+  },
+);
 
-orderSchema.pre("validate", async function (next) {
+orderSchema.pre("validate", function () {
   if (!this.orderNumber) {
-    const count = await model("Order").countDocuments();
-    this.orderNumber = String(1001 + count);
+    this.orderNumber =
+      `${Date.now().toString(36)}${randomBytes(3).toString("hex")}`.toUpperCase();
   }
 });
 

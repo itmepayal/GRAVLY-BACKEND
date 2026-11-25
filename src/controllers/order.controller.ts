@@ -16,27 +16,12 @@ import {
 } from "../service/order.service.js";
 
 import { BadRequestError } from "../utils/errors/app.error.js";
-import { cafeIdOf } from "../utils/order/requestUser.js";
+import { cafeIdOf, studentIdentityOf } from "../utils/order/requestUser.js";
+import { executeWithIdempotency } from "../infrastructure/redis/index.js";
 
 /* =====================================================
    HELPERS
 ===================================================== */
-
-const getUserId = (req: Request): string => {
-  const user = req.user;
-
-  if (!user) {
-    throw new BadRequestError("Authenticated user is missing");
-  }
-
-  const id = user._id;
-
-  if (!id) {
-    throw new BadRequestError("Authenticated user ID is missing");
-  }
-
-  return String(id);
-};
 
 const getCafeId = async (req: Request): Promise<string> => {
   const cafeId = String(await cafeIdOf(req));
@@ -99,9 +84,18 @@ export const placeOrder = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const studentId = getUserId(req);
+    const { studentId, userId } = await studentIdentityOf(req);
+    const idempotencyKey =
+      typeof req.headers["idempotency-key"] === "string"
+        ? req.headers["idempotency-key"]
+        : undefined;
 
-    const order = await placeOrderService(studentId);
+    const { value: order } = await executeWithIdempotency(
+      "order:place",
+      studentId,
+      idempotencyKey,
+      () => placeOrderService(studentId, userId),
+    );
 
     res.status(201).json({
       success: true,
@@ -124,9 +118,9 @@ export const getMyOrders = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const studentId = getUserId(req);
+    const { studentId, userId } = await studentIdentityOf(req);
 
-    const data = await getMyOrdersService(studentId, pagingQuery(req));
+    const data = await getMyOrdersService(studentId, pagingQuery(req), userId);
 
     res.status(200).json({
       success: true,
@@ -149,12 +143,12 @@ export const getMyOrder = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const studentId = getUserId(req);
+    const { studentId, userId } = await studentIdentityOf(req);
     const orderId = String(req.params.orderId);
 
     validateObjectId(orderId);
 
-    const order = await getMyOrderService(studentId, orderId);
+    const order = await getMyOrderService(studentId, orderId, userId);
 
     res.status(200).json({
       success: true,
@@ -177,12 +171,12 @@ export const cancelMyOrder = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const studentId = getUserId(req);
+    const { studentId, userId } = await studentIdentityOf(req);
     const orderId = String(req.params.orderId);
 
     validateObjectId(orderId);
 
-    const order = await cancelMyOrderService(studentId, orderId);
+    const order = await cancelMyOrderService(studentId, orderId, userId);
 
     res.status(200).json({
       success: true,

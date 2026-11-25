@@ -10,6 +10,7 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
+import { paymentInitiateLimiter } from "../../middlewares/rateLimiter.middleware.js";
 
 const STUDENT = "student";
 
@@ -87,7 +88,7 @@ const studentOnly = [authenticate, authorize(STUDENT)];
  *       500:
  *         description: Internal server error
  */
-router.post("/initiate", ...studentOnly, initiatePayment);
+router.post("/initiate", ...studentOnly, paymentInitiateLimiter, initiatePayment);
 
 /**
  * @openapi

@@ -1,12 +1,16 @@
-import type { Server } from "http";
+import http, { type Server } from "http";
 
 import { connectDB } from "./config/db.config.js";
+import { initRedis, closeRedis } from "./config/redis.config.js";
 import logger from "./config/logger.config.js";
 import { serverConfig } from "./config/index.js";
-import createApp from "./app/app.js";
+import createApp, { markServerDraining } from "./app/app.js";
+import { initSocketServer, closeSocketServer } from "./socket/index.js";
+import { startBackgroundJobs, stopBackgroundJobs } from "./job/index.js";
 
 let httpServer: Server | undefined;
 let isShuttingDown = false;
+let memoryMonitorTimer: NodeJS.Timeout | undefined;
 
 const shutdown = async (signal: string): Promise<void> => {
   if (isShuttingDown) {
@@ -14,6 +18,12 @@ const shutdown = async (signal: string): Promise<void> => {
   }
 
   isShuttingDown = true;
+  markServerDraining(true);
+
+  if (memoryMonitorTimer) {
+    clearInterval(memoryMonitorTimer);
+    memoryMonitorTimer = undefined;
+  }
 
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
@@ -25,20 +35,44 @@ const shutdown = async (signal: string): Promise<void> => {
   forceShutdownTimer.unref();
 
   try {
-    if (httpServer) {
-      await new Promise<void>((resolve, reject) => {
-        httpServer!.close((error) => {
-          if (error) {
-            reject(error);
-            return;
-          }
+    const drainDelayMs = Number(process.env.SHUTDOWN_DRAIN_DELAY_MS) || 0;
+    if (drainDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, drainDelayMs));
+    }
 
-          resolve();
-        });
-      });
+    await stopBackgroundJobs();
+
+    if (httpServer) {
+      httpServer.closeIdleConnections?.();
+    }
+
+    await closeSocketServer();
+
+    if (httpServer && httpServer.listening) {
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          httpServer!.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve();
+          });
+          httpServer!.closeIdleConnections?.();
+        }),
+        new Promise<void>((resolve) => {
+          const drainTimer = setTimeout(() => {
+            httpServer?.closeAllConnections?.();
+            resolve();
+          }, 2500);
+          if (drainTimer.unref) drainTimer.unref();
+        }),
+      ]);
 
       logger.info("HTTP server closed successfully.");
     }
+
+    await closeRedis();
 
     const mongoose = await import("mongoose");
 
@@ -72,10 +106,22 @@ const shutdown = async (signal: string): Promise<void> => {
 const startServer = async (): Promise<void> => {
   try {
     await connectDB();
+    await initRedis();
     const app = createApp();
 
-    httpServer = app.listen(serverConfig.PORT, "0.0.0.0", () => {
-      logger.info(`Gravly Backend running on port ${serverConfig.PORT}`);
+    httpServer = http.createServer(app);
+    httpServer.keepAliveTimeout = 65_000;
+    httpServer.headersTimeout = 66_000;
+    httpServer.requestTimeout = 30_000;
+    httpServer.maxRequestsPerSocket = 0;
+
+    await initSocketServer(httpServer);
+
+    httpServer.listen(serverConfig.PORT, "0.0.0.0", () => {
+      logger.info(`Gravly Backend running on port ${serverConfig.PORT}`, {
+        pid: process.pid,
+        workerIndex: process.env.NODE_APP_INSTANCE ?? "standalone",
+      });
 
       logger.info(`Health check: http://localhost:${serverConfig.PORT}/health`);
 
@@ -84,7 +130,29 @@ const startServer = async (): Promise<void> => {
       );
 
       logger.info("Press Ctrl+C to stop the server.");
+
+      if (typeof process.send === "function") {
+        process.send("ready");
+      }
     });
+
+    startBackgroundJobs();
+
+    const memoryWarnMb = Number(process.env.MEMORY_WARN_MB) || 768;
+    memoryMonitorTimer = setInterval(() => {
+      const mem = process.memoryUsage();
+      const rssMb = Math.round((mem.rss / 1048576) * 100) / 100;
+      const heapMb = Math.round((mem.heapUsed / 1048576) * 100) / 100;
+      if (rssMb >= memoryWarnMb) {
+        logger.warn("[process] High memory usage detected", {
+          pid: process.pid,
+          rssMb,
+          heapMb,
+          thresholdMb: memoryWarnMb,
+        });
+      }
+    }, 30_000);
+    if (memoryMonitorTimer.unref) memoryMonitorTimer.unref();
 
     httpServer.on("error", (error: NodeJS.ErrnoException) => {
       logger.error("HTTP server error.", {

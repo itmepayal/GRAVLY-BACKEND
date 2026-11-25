@@ -1,5 +1,4 @@
 import { Types } from "mongoose";
-import bcrypt from "bcryptjs";
 
 import { User } from "../models/user.model.js";
 import { Student } from "../models/student.model.js";
@@ -7,8 +6,27 @@ import { Cafe } from "../models/cafe.model.js";
 import { Order } from "../models/order.model.js";
 import { Payment } from "../models/payment.model.js";
 import { RefreshToken } from "../models/refreshToken.model.js";
+import { Session } from "../models/session.model.js";
 
-import { BadRequestError, NotFoundError } from "../utils/errors/app.error.js";
+import {
+  BadRequestError,
+  ForbiddenError,
+  NotFoundError,
+} from "../utils/errors/app.error.js";
+import {
+  clearUserCache,
+  incrementUserTokenVersion,
+  broadcastUserRevocation,
+  ROLE_RANK,
+} from "../middlewares/authenticate.middleware.js";
+import { runWithOptionalTransaction } from "../config/db.config.js";
+import { hashPassword, verifyPassword } from "../utils/password/password.js";
+import { logSecurityAudit } from "../config/logger.config.js";
+import {
+  REDIS_TTLS,
+  getOrLoadCachedJson,
+  redisKeys,
+} from "../infrastructure/redis/index.js";
 
 /* =========================================================
    CONSTANTS
@@ -16,6 +34,37 @@ import { BadRequestError, NotFoundError } from "../utils/errors/app.error.js";
 const ACTIVE_STATUSES = ["pending", "confirmed", "preparing", "ready"] as const;
 
 const VALID_ROLES = ["student", "admin", "cafeOwner"] as const;
+const VALID_ORDER_STATUSES = [
+  "pending",
+  "confirmed",
+  "preparing",
+  "ready",
+  "delivered",
+  "cancelled",
+  "rejected",
+] as const;
+const VALID_ORDER_PAYMENT_STATUSES = [
+  "pending",
+  "paid",
+  "failed",
+  "refunded",
+] as const;
+const VALID_ORDER_PAYMENT_METHODS = ["online", "cash"] as const;
+const VALID_ORDER_METHODS = ["delivery", "self_pickup"] as const;
+const VALID_PAYMENT_STATUSES = [
+  "pending",
+  "success",
+  "failed",
+  "refunded",
+] as const;
+const VALID_PAYMENT_METHODS = [
+  "card",
+  "upi",
+  "wallet",
+  "cashfree",
+  "cash",
+] as const;
+const VALID_SETTLEMENT_STATUSES = ["unsettled", "settled"] as const;
 
 type QueryInput = Record<string, unknown>;
 type MongoFilter = Record<string, any>;
@@ -135,75 +184,87 @@ const searchRegex = (value: unknown): RegExp | undefined => {
 ========================================================= */
 
 export const getDashboardOverviewService = async () => {
-  const [
-    revenueAgg,
-    totalOrders,
-    activeNow,
-    openCafes,
-    totalUsers,
-    newCafeRequests,
-    students,
-    cafeOwners,
-  ] = await Promise.all([
-    Payment.aggregate([
-      {
-        $match: {
-          status: "success",
-        },
-      },
-      {
-        $group: {
-          _id: null,
-          total: {
-            $sum: "$amount",
+  return getOrLoadCachedJson(
+    redisKeys.adminDashboard(),
+    REDIS_TTLS.ADMIN_DASHBOARD_CACHE_SEC,
+    async () => {
+      const [
+        revenueAgg,
+        totalOrders,
+        activeNow,
+        openCafes,
+        newCafeRequests,
+        userCountsByRole,
+      ] = await Promise.all([
+        Payment.aggregate<{ total: number }>([
+          {
+            $match: {
+              status: "success",
+            },
           },
+          {
+            $group: {
+              _id: null,
+              total: {
+                $sum: "$amount",
+              },
+            },
+          },
+        ]),
+
+        Order.estimatedDocumentCount(),
+
+        Order.countDocuments({
+          status: {
+            $in: [...ACTIVE_STATUSES],
+          },
+        }),
+
+        Cafe.countDocuments({
+          isApproved: true,
+          isActive: true,
+          isOpen: true,
+        }),
+
+        Cafe.countDocuments({
+          approvalStatus: "pending",
+        }),
+
+        User.aggregate<{ _id: string; count: number }>([
+          {
+            $group: {
+              _id: "$role",
+              count: { $sum: 1 },
+            },
+          },
+        ]),
+      ]);
+
+      let totalUsers = 0;
+      let students = 0;
+      let cafeOwners = 0;
+      for (const row of userCountsByRole) {
+        totalUsers += row.count;
+        if (row._id === "student") students = row.count;
+        else if (row._id === "cafeOwner") cafeOwners = row.count;
+      }
+
+      return {
+        totalRevenue: revenueAgg[0]?.total ?? 0,
+        totalOrders,
+        activeNow,
+        openCafes,
+        allUsers: totalUsers,
+
+        usersBreakdown: {
+          students,
+          cafeOwners,
         },
-      },
-    ]),
 
-    Order.countDocuments(),
-
-    Order.countDocuments({
-      status: {
-        $in: [...ACTIVE_STATUSES],
-      },
-    }),
-
-    Cafe.countDocuments({
-      isApproved: true,
-      isActive: true,
-      isOpen: true,
-    }),
-
-    User.countDocuments(),
-
-    Cafe.countDocuments({
-      approvalStatus: "pending",
-    }),
-
-    User.countDocuments({
-      role: "student",
-    }),
-
-    User.countDocuments({
-      role: "cafeOwner",
-    }),
-  ]);
-
-  return {
-    totalRevenue: revenueAgg[0]?.total ?? 0,
-    totalOrders,
-    activeNow,
-    openCafes,
-    allUsers: totalUsers,
-
-    usersBreakdown: {
-      students,
-      cafeOwners,
+        newCafeRequests,
+      };
     },
-
-    newCafeRequests,
-  };
+  );
 };
 
 /* =========================================================
@@ -227,7 +288,10 @@ export const getAllUsersService = async (query: QueryInput) => {
 
   const isActive = getString(query.isActive);
 
-  if (isActive === "true" || isActive === "false") {
+  if (isActive) {
+    if (isActive !== "true" && isActive !== "false") {
+      throw new BadRequestError("Invalid isActive filter");
+    }
     filter.isActive = isActive === "true";
   }
 
@@ -276,39 +340,39 @@ export const getUserDetailService = async (userId: string) => {
       user: id,
     }).lean();
 
-    if (profile) {
-      const agg = await Order.aggregate([
-        {
-          $match: {
-            student: profile._id,
+    const studentMatchIds = profile ? [profile._id, id] : [id];
+
+    const agg = await Order.aggregate([
+      {
+        $match: {
+          student: { $in: studentMatchIds },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+
+          totalOrders: {
+            $sum: 1,
+          },
+
+          totalSpent: {
+            $sum: {
+              $cond: [
+                {
+                  $eq: ["$paymentStatus", "paid"],
+                },
+                "$totalAmount",
+                0,
+              ],
+            },
           },
         },
-        {
-          $group: {
-            _id: null,
+      },
+    ]);
 
-            totalOrders: {
-              $sum: 1,
-            },
-
-            totalSpent: {
-              $sum: {
-                $cond: [
-                  {
-                    $eq: ["$paymentStatus", "paid"],
-                  },
-                  "$totalAmount",
-                  0,
-                ],
-              },
-            },
-          },
-        },
-      ]);
-
-      stats.totalOrders = agg[0]?.totalOrders ?? 0;
-      stats.totalSpent = agg[0]?.totalSpent ?? 0;
-    }
+    stats.totalOrders = agg[0]?.totalOrders ?? 0;
+    stats.totalSpent = agg[0]?.totalSpent ?? 0;
   }
 
   if (user.role === "cafeOwner") {
@@ -374,36 +438,194 @@ export const setUserActiveService = async (
     throw new BadRequestError("You cannot change your own active status");
   }
 
-  const user = await User.findByIdAndUpdate(
-    id,
-    {
-      $set: {
-        isActive,
-      },
-    },
-    {
-      new: true,
-      runValidators: true,
-    },
-  ).select("-password -fcmTokens");
-
-  if (!user) {
+  const targetUser = await User.findById(id).select("role");
+  if (!targetUser) {
     throw new NotFoundError("User not found");
   }
 
-  if (!isActive) {
-    await RefreshToken.deleteMany({
-      user: id,
+  if (ROLE_RANK[targetUser.role] >= ROLE_RANK.admin) {
+    logSecurityAudit({
+      eventType: "PRIVILEGE_ESCALATION_ATTEMPT",
+      userId: id.toString(),
+      actorId: currentAdminId.toString(),
+      success: false,
+      reasonCode: "CANNOT_MODIFY_ADMIN_STATUS",
     });
+    throw new ForbiddenError("Insufficient privileges to manage this user");
   }
 
+  let newTokenVersion: number | undefined;
+  const user = await runWithOptionalTransaction(async (txSession) => {
+    const sessionOpt = txSession ? { session: txSession } : {};
+    const updatedUser = await User.findByIdAndUpdate(
+      id,
+      {
+        $set: {
+          isActive,
+        },
+      },
+      {
+        returnDocument: "after",
+        runValidators: true,
+        ...sessionOpt,
+      },
+    ).select("-password -fcmTokens");
+
+    if (!updatedUser) {
+      throw new NotFoundError("User not found");
+    }
+
+    if (!isActive) {
+      const now = new Date();
+      await Session.updateMany(
+        { user: id, status: "ACTIVE" },
+        {
+          $set: {
+            status: "REVOKED",
+            revokedAt: now,
+            revokedReason: "account_deactivated",
+          },
+        },
+        sessionOpt,
+      );
+      await RefreshToken.updateMany(
+        {
+          user: id,
+          status: { $ne: "revoked" },
+        },
+        {
+          $set: {
+            status: "revoked",
+            isRevoked: true,
+            revokedAt: now,
+            revokedReason: "account_deactivated",
+          },
+        },
+        sessionOpt,
+      );
+      newTokenVersion = await incrementUserTokenVersion(id.toString(), txSession);
+    }
+
+    return updatedUser;
+  });
+
+  if (!isActive && newTokenVersion !== undefined) {
+    await broadcastUserRevocation(
+      id.toString(),
+      newTokenVersion,
+      "account_deactivated",
+    );
+  } else {
+    await clearUserCache(id.toString());
+  }
+
+  logSecurityAudit({
+    eventType: isActive ? "ACCOUNT_REACTIVATED" : "ACCOUNT_DEACTIVATED",
+    userId: id.toString(),
+    actorId: currentAdminId.toString(),
+    success: true,
+    reasonCode: isActive ? "ADMIN_ACTIVATED_USER" : "ADMIN_DEACTIVATED_USER",
+  });
+
   return user;
+};
+
+export const adminForceLogoutService = async (
+  targetUserId: string,
+  adminId: string,
+  requestId?: string,
+): Promise<{ revokedSessions: number }> => {
+  const id = oid(targetUserId, "user ID");
+  const currentAdminId = oid(adminId, "admin ID");
+
+  if (id.equals(currentAdminId)) {
+    throw new BadRequestError(
+      "Use /auth/logout-all to revoke your own sessions",
+    );
+  }
+
+  const targetUser = await User.findById(id).select("role");
+  if (!targetUser) {
+    throw new NotFoundError("User not found");
+  }
+
+  if (ROLE_RANK[targetUser.role] >= ROLE_RANK.admin) {
+    logSecurityAudit({
+      eventType: "PRIVILEGE_ESCALATION_ATTEMPT",
+      userId: id.toString(),
+      actorId: currentAdminId.toString(),
+      requestId,
+      success: false,
+      reasonCode: "CANNOT_FORCE_LOGOUT_ADMIN",
+    });
+    throw new ForbiddenError(
+      "Insufficient privileges to revoke sessions for this user",
+    );
+  }
+
+  const { revokedSessions, newTokenVersion } = await runWithOptionalTransaction(
+    async (txSession) => {
+      const sessionOpt = txSession ? { session: txSession } : {};
+      const now = new Date();
+      const sessionResult = await Session.updateMany(
+        { user: id, status: "ACTIVE" },
+        {
+          $set: {
+            status: "REVOKED",
+            revokedAt: now,
+            revokedReason: "admin_forced_revocation",
+          },
+        },
+        sessionOpt,
+      );
+
+      await RefreshToken.updateMany(
+        { user: id, status: { $ne: "revoked" } },
+        {
+          $set: {
+            status: "revoked",
+            isRevoked: true,
+            revokedAt: now,
+            revokedReason: "admin_forced_revocation",
+          },
+        },
+        sessionOpt,
+      );
+
+      const nextVersion = await incrementUserTokenVersion(
+        id.toString(),
+        txSession,
+      );
+
+      return {
+        revokedSessions: sessionResult.modifiedCount,
+        newTokenVersion: nextVersion,
+      };
+    },
+  );
+
+  await broadcastUserRevocation(
+    id.toString(),
+    newTokenVersion,
+    "admin_forced_revocation",
+  );
+
+  logSecurityAudit({
+    eventType: "ADMIN_FORCED_SESSION_REVOCATION",
+    userId: id.toString(),
+    actorId: currentAdminId.toString(),
+    requestId,
+    success: true,
+    reasonCode: "ADMIN_REVOKED_USER_SESSIONS",
+    metadata: { revokedSessions },
+  });
+
+  return { revokedSessions };
 };
 
 /* =========================================================
    ORDERS
 ========================================================= */
-
 const orderPopulate = [
   {
     path: "student",
@@ -436,10 +658,38 @@ export const getAllOrdersService = async (query: QueryInput) => {
   const paymentMethod = getString(query.paymentMethod);
   const orderMethod = getString(query.orderMethod);
 
-  if (status) filter.status = status;
-  if (paymentStatus) filter.paymentStatus = paymentStatus;
-  if (paymentMethod) filter.paymentMethod = paymentMethod;
-  if (orderMethod) filter.orderMethod = orderMethod;
+  if (status) {
+    if (!(VALID_ORDER_STATUSES as readonly string[]).includes(status)) {
+      throw new BadRequestError("Invalid order status filter");
+    }
+    filter.status = status;
+  }
+  if (paymentStatus) {
+    if (
+      !(VALID_ORDER_PAYMENT_STATUSES as readonly string[]).includes(
+        paymentStatus,
+      )
+    ) {
+      throw new BadRequestError("Invalid paymentStatus filter");
+    }
+    filter.paymentStatus = paymentStatus;
+  }
+  if (paymentMethod) {
+    if (
+      !(VALID_ORDER_PAYMENT_METHODS as readonly string[]).includes(
+        paymentMethod,
+      )
+    ) {
+      throw new BadRequestError("Invalid paymentMethod filter");
+    }
+    filter.paymentMethod = paymentMethod;
+  }
+  if (orderMethod) {
+    if (!(VALID_ORDER_METHODS as readonly string[]).includes(orderMethod)) {
+      throw new BadRequestError("Invalid orderMethod filter");
+    }
+    filter.orderMethod = orderMethod;
+  }
 
   const cafe = getString(query.cafe);
   const student = getString(query.student);
@@ -458,16 +708,72 @@ export const getAllOrdersService = async (query: QueryInput) => {
     filter.orderNumber = regex;
   }
 
-  const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .populate(orderPopulate)
-      .sort({ createdAt: -1, _id: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean(),
+  const isUnfiltered = Object.keys(filter).length === 0;
 
-    Order.countDocuments(filter),
+  const rawOrders = await Order.find(filter)
+    .sort({ createdAt: -1, _id: -1 })
+    .skip(skip)
+    .limit(limit)
+    .lean();
+
+  const studentIds = Array.from(new Set(rawOrders.map((o) => String(o.student))));
+  const cafeIds = Array.from(new Set(rawOrders.map((o) => String(o.cafe))));
+  const paymentIds = Array.from(
+    new Set(rawOrders.map((o) => o.paymentId).filter(Boolean).map((id) => String(id))),
+  );
+
+  const [students, cafes, payments, total] = await Promise.all([
+    studentIds.length
+      ? Student.find({ _id: { $in: studentIds } })
+          .select("rollNumber course semester collegeName user")
+          .lean()
+      : Promise.resolve([]),
+    cafeIds.length
+      ? Cafe.find({ _id: { $in: cafeIds } })
+          .select("name code contactNumber email city logo")
+          .lean()
+      : Promise.resolve([]),
+    paymentIds.length
+      ? Payment.find({ _id: { $in: paymentIds } })
+          .select(
+            "paymentId method status amount transactionId paidAt commission cafeEarning settlementStatus",
+          )
+          .lean()
+      : Promise.resolve([]),
+    skip === 0 && rawOrders.length < limit
+      ? Promise.resolve(rawOrders.length)
+      : isUnfiltered
+        ? Order.estimatedDocumentCount()
+        : Order.countDocuments(filter),
   ]);
+
+  const userIds = Array.from(
+    new Set(students.map((s) => s.user).filter(Boolean).map((id) => String(id))),
+  );
+  const users = userIds.length
+    ? await User.find({ _id: { $in: userIds } })
+        .select("name email phone profileImage")
+        .lean()
+    : [];
+
+  const userById = new Map(users.map((u) => [String(u._id), u]));
+  const studentById = new Map(
+    students.map((s) => [
+      String(s._id),
+      { ...s, user: userById.get(String(s.user)) ?? s.user },
+    ]),
+  );
+  const cafeById = new Map(cafes.map((c) => [String(c._id), c]));
+  const paymentById = new Map(payments.map((p) => [String(p._id), p]));
+
+  const orders = rawOrders.map((o) => ({
+    ...o,
+    student: studentById.get(String(o.student)) ?? o.student,
+    cafe: cafeById.get(String(o.cafe)) ?? o.cafe,
+    ...(o.paymentId
+      ? { paymentId: paymentById.get(String(o.paymentId)) ?? o.paymentId }
+      : {}),
+  }));
 
   return {
     orders,
@@ -521,10 +827,20 @@ export const getAllPaymentsService = async (query: QueryInput) => {
   const settlementStatus = getString(query.settlementStatus);
 
   if (method) {
+    if (!(VALID_PAYMENT_METHODS as readonly string[]).includes(method)) {
+      throw new BadRequestError("Invalid payment method filter");
+    }
     base.method = method;
   }
 
   if (settlementStatus) {
+    if (
+      !(VALID_SETTLEMENT_STATUSES as readonly string[]).includes(
+        settlementStatus,
+      )
+    ) {
+      throw new BadRequestError("Invalid settlementStatus filter");
+    }
     base.settlementStatus = settlementStatus;
   }
 
@@ -552,6 +868,9 @@ export const getAllPaymentsService = async (query: QueryInput) => {
   const status = getString(query.status);
 
   if (status) {
+    if (!(VALID_PAYMENT_STATUSES as readonly string[]).includes(status)) {
+      throw new BadRequestError("Invalid payment status filter");
+    }
     filter.status = status;
   }
 
@@ -690,7 +1009,23 @@ export const updateAdminProfileService = async (
       throw new BadRequestError("Invalid profile image");
     }
 
-    update.profileImage = body.profileImage.trim();
+    const trimmedImg = body.profileImage.trim();
+    if (trimmedImg.length > 500) {
+      throw new BadRequestError("Profile image URL must not exceed 500 characters");
+    }
+    if (trimmedImg) {
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(trimmedImg);
+      } catch {
+        throw new BadRequestError("Invalid profile image URL");
+      }
+      if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+        throw new BadRequestError("Profile image URL must use http or https");
+      }
+    }
+
+    update.profileImage = trimmedImg;
   }
 
   if (Object.keys(update).length === 0) {
@@ -714,6 +1049,8 @@ export const updateAdminProfileService = async (
   if (!admin) {
     throw new NotFoundError("Admin not found");
   }
+
+  await clearUserCache(id.toString());
 
   return admin;
 };
@@ -739,12 +1076,6 @@ export const changeAdminPasswordService = async (
     throw new BadRequestError("currentPassword and newPassword are required");
   }
 
-  if (newPassword.length < 8 || newPassword.length > 128) {
-    throw new BadRequestError(
-      "New password must be between 8 and 128 characters",
-    );
-  }
-
   const admin = await User.findOne({
     _id: id,
     role: "admin",
@@ -758,13 +1089,19 @@ export const changeAdminPasswordService = async (
     throw new BadRequestError("Password login is not enabled for this account");
   }
 
-  const passwordMatches = await bcrypt.compare(currentPassword, admin.password);
+  const passwordMatches = await verifyPassword(currentPassword, admin.password);
 
   if (!passwordMatches) {
+    logSecurityAudit({
+      eventType: "ADMIN_LOGIN_FAILURE",
+      userId: admin._id.toString(),
+      success: false,
+      reasonCode: "CHANGE_PASSWORD_WRONG_CURRENT",
+    });
     throw new BadRequestError("Current password is incorrect");
   }
 
-  const samePassword = await bcrypt.compare(newPassword, admin.password);
+  const samePassword = await verifyPassword(newPassword, admin.password);
 
   if (samePassword) {
     throw new BadRequestError(
@@ -772,12 +1109,59 @@ export const changeAdminPasswordService = async (
     );
   }
 
-  admin.password = await bcrypt.hash(newPassword, 12);
+  admin.password = await hashPassword(newPassword);
 
-  await admin.save();
+  const newTokenVersion = await runWithOptionalTransaction(async (txSession) => {
+    const sessionOpt = txSession ? { session: txSession } : {};
+    await admin.save(sessionOpt);
 
-  await RefreshToken.deleteMany({
-    user: admin._id,
+    const now = new Date();
+    await Session.updateMany(
+      {
+        user: admin._id,
+        status: "ACTIVE",
+      },
+      {
+        $set: {
+          status: "REVOKED",
+          revokedAt: now,
+          revokedReason: "password_changed",
+        },
+      },
+      sessionOpt,
+    );
+
+    await RefreshToken.updateMany(
+      {
+        user: admin._id,
+        status: { $ne: "revoked" },
+      },
+      {
+        $set: {
+          status: "revoked",
+          isRevoked: true,
+          revokedAt: now,
+          revokedReason: "password_changed",
+        },
+      },
+      sessionOpt,
+    );
+
+    return incrementUserTokenVersion(admin._id.toString(), txSession);
+  });
+
+  await broadcastUserRevocation(
+    admin._id.toString(),
+    newTokenVersion,
+    "password_changed",
+  );
+
+  logSecurityAudit({
+    eventType: "ADMIN_PASSWORD_CHANGED",
+    userId: admin._id.toString(),
+    actorId: admin._id.toString(),
+    success: true,
+    reasonCode: "ADMIN_PASSWORD_ROTATED",
   });
 
   return {

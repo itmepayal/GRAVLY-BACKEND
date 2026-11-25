@@ -11,6 +11,7 @@ import {
   ConflictError,
   NotFoundError,
 } from "../utils/errors/app.error.js";
+import { invalidatePublicMenuCaches } from "./cafe.service.js";
 
 /* =====================================================
    HELPERS
@@ -26,8 +27,14 @@ const toBool = (v: unknown, field: string): boolean => {
 };
 
 const toNumber = (v: unknown, field: string): number => {
+  if (typeof v !== "number" && typeof v !== "string") {
+    throw new BadRequestError(`${field} must be a valid number`);
+  }
+  if (typeof v === "string" && !v.trim()) {
+    throw new BadRequestError(`${field} must be a valid number`);
+  }
   const n = Number(v);
-  if (v === "" || v === null || !Number.isFinite(n)) {
+  if (!Number.isFinite(n)) {
     throw new BadRequestError(`${field} must be a valid number`);
   }
   return n;
@@ -97,6 +104,19 @@ export const createMenuItemService = async (
 
   const name = str(b.name);
   if (!name) throw new BadRequestError("Item name is required");
+  if (name.length > 150) {
+    throw new BadRequestError("Item name must not exceed 150 characters");
+  }
+
+  const description = str(b.description);
+  if (description.length > 1000) {
+    throw new BadRequestError("Description must not exceed 1000 characters");
+  }
+
+  const category = str(b.category) || "General";
+  if (category.length > 100) {
+    throw new BadRequestError("Category must not exceed 100 characters");
+  }
 
   const price = toNumber(b.price, "price");
   if (price < 0) throw new BadRequestError("Price cannot be negative");
@@ -120,9 +140,9 @@ export const createMenuItemService = async (
     const item = await MenuItem.create({
       cafe: cafeId,
       name,
-      description: str(b.description) || undefined,
+      description: description || undefined,
       price,
-      category: str(b.category) || "General",
+      category,
       isVeg: b.isVeg === undefined ? true : toBool(b.isVeg, "isVeg"),
       isAvailable:
         b.isAvailable === undefined
@@ -133,6 +153,7 @@ export const createMenuItemService = async (
       ...(image && { image: { url: image.url, publicId: image.publicId } }),
     });
 
+    await invalidatePublicMenuCaches(String(cafeId));
     return withStatus(item.toObject());
   } catch (error) {
     return duplicateGuard(error);
@@ -172,6 +193,7 @@ export const listMyMenuService = async (
 
   const items = await MenuItem.find(filter)
     .sort({ category: 1, name: 1 })
+    .limit(500)
     .lean();
 
   return items.map(withStatus);
@@ -198,11 +220,24 @@ export const updateMenuItemService = async (
   if (b.name !== undefined) {
     const name = str(b.name);
     if (!name) throw new BadRequestError("Item name cannot be empty");
+    if (name.length > 150) {
+      throw new BadRequestError("Item name must not exceed 150 characters");
+    }
     update.name = name;
   }
-  if (b.description !== undefined) update.description = str(b.description);
+  if (b.description !== undefined) {
+    const description = str(b.description);
+    if (description.length > 1000) {
+      throw new BadRequestError("Description must not exceed 1000 characters");
+    }
+    update.description = description;
+  }
   if (b.category !== undefined) {
-    update.category = str(b.category) || "General";
+    const category = str(b.category) || "General";
+    if (category.length > 100) {
+      throw new BadRequestError("Category must not exceed 100 characters");
+    }
+    update.category = category;
   }
   if (b.price !== undefined) {
     const price = toNumber(b.price, "price");
@@ -231,6 +266,7 @@ export const updateMenuItemService = async (
     ).lean();
 
     if (!item) throw new NotFoundError("Menu item not found");
+    await invalidatePublicMenuCaches(String(cafeId));
     return withStatus(item);
   } catch (error) {
     if (error instanceof NotFoundError) throw error;
@@ -256,6 +292,7 @@ export const setMenuAvailabilityService = async (
   ).lean();
 
   if (!item) throw new NotFoundError("Menu item not found");
+  await invalidatePublicMenuCaches(String(cafeId));
   return withStatus(item);
 };
 
@@ -317,6 +354,7 @@ export const updateMenuStockService = async (
     throw new ConflictError("Not enough stock for this adjustment");
   }
 
+  await invalidatePublicMenuCaches(String(cafeId));
   return withStatus(item);
 };
 
@@ -333,6 +371,7 @@ export const deleteMenuItemService = async (
   const item = await MenuItem.findOneAndDelete({ _id: itemId, cafe: cafeId });
   if (!item) throw new NotFoundError("Menu item not found");
 
+  await invalidatePublicMenuCaches(String(cafeId));
   return { _id: item._id, name: item.name };
 };
 
@@ -346,6 +385,14 @@ export const setMenuStockStatusService = async (
   stock?: number,
 ) => {
   assertObjectId(itemId, "item ID");
+  if (stock !== undefined) {
+    if (!inStock) {
+      throw new BadRequestError("stock can only be sent when inStock is true");
+    }
+    if (!Number.isInteger(stock) || stock < 1) {
+      throw new BadRequestError("stock must be a positive integer");
+    }
+  }
   const cafeId = await getOwnerCafeId(ownerId);
 
   const current = await MenuItem.findOne({ _id: itemId, cafe: cafeId }).lean();
@@ -374,5 +421,6 @@ export const setMenuStockStatusService = async (
 
   if (!item) throw new NotFoundError("Menu item not found");
 
+  await invalidatePublicMenuCaches(String(cafeId));
   return withStatus(item);
 };

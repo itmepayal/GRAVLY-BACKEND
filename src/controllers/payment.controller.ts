@@ -8,26 +8,12 @@ import {
 } from "../service/payment.service.js";
 
 import { BadRequestError } from "../utils/errors/app.error.js";
+import { studentIdentityOf } from "../utils/order/requestUser.js";
+import { executeWithIdempotency } from "../infrastructure/redis/index.js";
 
 /* =====================================================
    HELPERS
 ===================================================== */
-
-const getUserId = (req: Request): string => {
-  const user = req.user;
-
-  if (!user) {
-    throw new BadRequestError("Authenticated user is missing");
-  }
-
-  const id = user._id;
-
-  if (!id) {
-    throw new BadRequestError("Authenticated user ID is missing");
-  }
-
-  return String(id);
-};
 
 const validateObjectId = (id: string, fieldName = "order ID"): void => {
   if (!Types.ObjectId.isValid(id)) {
@@ -51,7 +37,7 @@ export const initiatePayment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const studentId = getUserId(req);
+    const { studentId, userId } = await studentIdentityOf(req);
 
     const orderId =
       typeof req.body?.orderId === "string" ? req.body.orderId.trim() : "";
@@ -62,7 +48,17 @@ export const initiatePayment = async (
 
     validateObjectId(orderId);
 
-    const data = await initiatePaymentService(studentId, orderId);
+    const idempotencyKey =
+      typeof req.headers["idempotency-key"] === "string"
+        ? req.headers["idempotency-key"]
+        : undefined;
+
+    const { value: data } = await executeWithIdempotency(
+      "payment:initiate",
+      `${studentId}:${orderId}`,
+      idempotencyKey,
+      () => initiatePaymentService(studentId, orderId, userId),
+    );
 
     res.status(200).json({
       success: true,
@@ -85,12 +81,12 @@ export const getPaymentStatus = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const studentId = getUserId(req);
+    const { studentId, userId } = await studentIdentityOf(req);
     const orderId = String(req.params.orderId);
 
     validateObjectId(orderId);
 
-    const data = await getPaymentStatusService(studentId, orderId);
+    const data = await getPaymentStatusService(studentId, orderId, userId);
 
     res.status(200).json({
       success: true,

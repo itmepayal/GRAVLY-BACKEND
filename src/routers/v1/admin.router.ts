@@ -9,6 +9,7 @@ import {
   getAllUsers,
   getUserDetail,
   setUserActive,
+  adminForceLogoutUser,
   getAllOrders,
   getOrderDetail,
   getAllPayments,
@@ -255,6 +256,26 @@ router.get("/users/:userId", getUserDetail);
  *       404: { description: User not found }
  */
 router.patch("/users/:userId/status", setUserActive);
+
+/**
+ * @swagger
+ * /admin/users/{userId}/revoke-sessions:
+ *   post:
+ *     summary: Force-revoke all active sessions for a user
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: User sessions revoked successfully }
+ *       403: { description: Forbidden }
+ *       404: { description: User not found }
+ */
+router.post("/users/:userId/revoke-sessions", adminForceLogoutUser);
 
 /* =========================================================
    ORDERS

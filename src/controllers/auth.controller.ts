@@ -1,10 +1,14 @@
-import { Request, Response } from "express";
+import { Request, Response, NextFunction } from "express";
 
 import {
   adminRegisterService,
   adminLoginService,
   refreshTokenService,
   logoutService,
+  logoutAllService,
+  listActiveSessionsService,
+  getCurrentSessionService,
+  revokeDeviceSessionService,
   googleStudentLoginService,
   appleStudentLoginService,
   googleCafeOwnerLoginService,
@@ -12,17 +16,11 @@ import {
 } from "../service/auth.service.js";
 
 import { BadRequestError } from "../utils/errors/app.error.js";
+import { extractClientMetadata } from "../utils/session/device.util.js";
 
 /* =====================================================
    TYPES
 ===================================================== */
-
-interface ControllerError {
-  message?: string;
-  status?: number;
-  statusCode?: number;
-}
-
 interface AuthenticatedUser {
   _id: unknown;
   name: string;
@@ -39,40 +37,6 @@ interface AuthResult {
   isApproved?: boolean;
   approvalStatus?: string;
 }
-
-/* =====================================================
-   COMMON ERROR HANDLER
-===================================================== */
-const sendError = (
-  res: Response,
-  error: unknown,
-  fallbackMessage: string,
-): void => {
-  const err = error as ControllerError;
-
-  const statusCode =
-    typeof err?.statusCode === "number"
-      ? err.statusCode
-      : typeof err?.status === "number"
-        ? err.status
-        : 500;
-
-  if (statusCode >= 400 && statusCode < 600 && err?.message) {
-    res.status(statusCode).json({
-      success: false,
-      message: err.message,
-    });
-
-    return;
-  }
-
-  console.error(fallbackMessage, error);
-
-  res.status(500).json({
-    success: false,
-    message: fallbackMessage,
-  });
-};
 
 /* =====================================================
    VALIDATION HELPERS
@@ -148,15 +112,19 @@ const validateOptionalFullName = (value: unknown): string | undefined => {
 export const googleLogin = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const idToken = validateString(req.body?.idToken, "Google ID token");
 
-    const result = await googleStudentLoginService(idToken);
+    const result = await googleStudentLoginService(
+      idToken,
+      extractClientMetadata(req),
+    );
 
     sendAuthSuccess(res, "Google login successful", result);
   } catch (error: unknown) {
-    sendError(res, error, "Something went wrong during Google login");
+    next(error);
   }
 };
 
@@ -168,6 +136,7 @@ export const googleLogin = async (
 export const appleLogin = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const identityToken = validateString(
@@ -177,11 +146,15 @@ export const appleLogin = async (
 
     const fullName = validateOptionalFullName(req.body?.fullName);
 
-    const result = await appleStudentLoginService(identityToken, fullName);
+    const result = await appleStudentLoginService(
+      identityToken,
+      fullName,
+      extractClientMetadata(req),
+    );
 
     sendAuthSuccess(res, "Apple login successful", result);
   } catch (error: unknown) {
-    sendError(res, error, "Something went wrong during Apple login");
+    next(error);
   }
 };
 
@@ -193,19 +166,19 @@ export const appleLogin = async (
 export const cafeOwnerGoogleLogin = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const idToken = validateString(req.body?.idToken, "Google ID token");
 
-    const result = await googleCafeOwnerLoginService(idToken);
+    const result = await googleCafeOwnerLoginService(
+      idToken,
+      extractClientMetadata(req),
+    );
 
     sendAuthSuccess(res, "Cafe Owner Google authentication successful", result);
   } catch (error: unknown) {
-    sendError(
-      res,
-      error,
-      "Something went wrong during Cafe Owner Google authentication",
-    );
+    next(error);
   }
 };
 
@@ -217,6 +190,7 @@ export const cafeOwnerGoogleLogin = async (
 export const cafeOwnerAppleLogin = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const identityToken = validateString(
@@ -226,15 +200,15 @@ export const cafeOwnerAppleLogin = async (
 
     const fullName = validateOptionalFullName(req.body?.fullName);
 
-    const result = await appleCafeOwnerLoginService(identityToken, fullName);
+    const result = await appleCafeOwnerLoginService(
+      identityToken,
+      fullName,
+      extractClientMetadata(req),
+    );
 
     sendAuthSuccess(res, "Cafe Owner Apple authentication successful", result);
   } catch (error: unknown) {
-    sendError(
-      res,
-      error,
-      "Something went wrong during Cafe Owner Apple authentication",
-    );
+    next(error);
   }
 };
 
@@ -246,6 +220,7 @@ export const cafeOwnerAppleLogin = async (
 export const adminRegister = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const name = validateString(req.body?.name, "Name");
@@ -261,7 +236,13 @@ export const adminRegister = async (
       "Admin registration secret",
     );
 
-    const result = await adminRegisterService(name, email, password, secret);
+    const result = await adminRegisterService(
+      name,
+      email,
+      password,
+      secret,
+      extractClientMetadata(req),
+    );
 
     res.status(201).json({
       success: true,
@@ -274,7 +255,7 @@ export const adminRegister = async (
       },
     });
   } catch (error: unknown) {
-    sendError(res, error, "Something went wrong during admin registration");
+    next(error);
   }
 };
 
@@ -286,6 +267,7 @@ export const adminRegister = async (
 export const adminLogin = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const email = validateString(req.body?.email, "Email");
@@ -295,11 +277,15 @@ export const adminLogin = async (
       throw new BadRequestError("Password is required");
     }
 
-    const result = await adminLoginService(email, password);
+    const result = await adminLoginService(
+      email,
+      password,
+      extractClientMetadata(req),
+    );
 
     sendAuthSuccess(res, "Admin login successful", result);
   } catch (error: unknown) {
-    sendError(res, error, "Something went wrong during admin login");
+    next(error);
   }
 };
 
@@ -311,6 +297,7 @@ export const adminLogin = async (
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
+  next: NextFunction,
 ): Promise<void> => {
   try {
     const refreshToken = validateString(
@@ -322,7 +309,7 @@ export const refreshAccessToken = async (
 
     sendAuthSuccess(res, "Token refreshed successfully", result);
   } catch (error: unknown) {
-    sendError(res, error, "Unable to refresh token");
+    next(error);
   }
 };
 
@@ -331,20 +318,138 @@ export const refreshAccessToken = async (
    POST /api/v1/auth/logout
 ===================================================== */
 
-export const logout = async (req: Request, res: Response): Promise<void> => {
+export const logout = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
   try {
     const refreshToken = validateString(
       req.body?.refreshToken,
       "Refresh token",
     );
 
-    await logoutService(refreshToken);
+    await logoutService(refreshToken, req.user?._id, req.auth);
 
     res.status(200).json({
       success: true,
       message: "Logout successful",
     });
   } catch (error: unknown) {
-    sendError(res, error, "Something went wrong during logout");
+    next(error);
+  }
+};
+
+/* =====================================================
+   LOGOUT ALL SESSIONS
+   POST /api/v1/auth/logout-all
+===================================================== */
+
+export const logoutAll = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const requestId = (req as Request & { requestId?: string }).requestId;
+    const data = await logoutAllService(req.user?._id, requestId);
+
+    res.status(200).json({
+      success: true,
+      message: "All sessions revoked successfully",
+      data,
+    });
+  } catch (error: unknown) {
+    next(error);
+  }
+};
+
+/* =====================================================
+   LIST ACTIVE SESSIONS
+   GET /api/v1/auth/sessions
+===================================================== */
+
+export const listActiveSessions = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const requestId = (req as Request & { requestId?: string }).requestId;
+    const data = await listActiveSessionsService(
+      String(req.user?._id),
+      req.auth?.sid,
+      req.query as Record<string, unknown>,
+      requestId,
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Active sessions fetched successfully",
+      data,
+    });
+  } catch (error: unknown) {
+    next(error);
+  }
+};
+
+/* =====================================================
+   GET CURRENT SESSION
+   GET /api/v1/auth/sessions/current
+===================================================== */
+
+export const getCurrentSession = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const data = await getCurrentSessionService(
+      String(req.user?._id),
+      req.auth?.sid,
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Current session fetched successfully",
+      data,
+    });
+  } catch (error: unknown) {
+    next(error);
+  }
+};
+
+/* =====================================================
+   REVOKE SPECIFIC DEVICE SESSION
+   DELETE /api/v1/auth/sessions/:sessionId
+===================================================== */
+
+export const revokeDeviceSession = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const requestId = (req as Request & { requestId?: string }).requestId;
+    const sessionId = validateString(req.params?.sessionId, "Session ID");
+
+    const data = await revokeDeviceSessionService(
+      String(req.user?._id),
+      sessionId,
+      req.auth?.sid,
+      req.auth?.jti,
+      requestId,
+      req.auth?.exp,
+    );
+
+    res.status(200).json({
+      success: true,
+      message: data.alreadyRevoked
+        ? "Session already revoked"
+        : "Device session revoked successfully",
+      data,
+    });
+  } catch (error: unknown) {
+    next(error);
   }
 };

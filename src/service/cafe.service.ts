@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { Types } from "mongoose";
 
-import { Cafe, IFile } from "../models/cafe.model.js";
+import { Cafe, type CafeApprovalStatus, IFile } from "../models/cafe.model.js";
 
 import {
   uploadImage,
@@ -16,6 +16,84 @@ import {
   NotFoundError,
 } from "../utils/errors/app.error.js";
 import { MenuItem } from "../models/menuItem.model.js";
+import {
+  emitCafeApprovalEvent,
+  emitCafeOpenStatusEvent,
+} from "../socket/index.js";
+import {
+  REDIS_TTLS,
+  cacheDeleteKeys,
+  getOrLoadCachedJson,
+  isRedisAvailable,
+  redisGet,
+  redisIncr,
+  redisKeys,
+} from "../infrastructure/redis/index.js";
+import { invalidateCafeIdCache } from "../utils/order/requestUser.js";
+
+export interface OrderableCafeMeta {
+  _id: Types.ObjectId | string;
+  name: string;
+  isOpen: boolean;
+  isApproved: boolean;
+  approvalStatus: CafeApprovalStatus;
+  isVisible: boolean;
+  isActive: boolean;
+  deliveryEnabled: boolean;
+  pickupEnabled: boolean;
+  deliveryFee: number;
+  platformFee: number;
+}
+
+export const invalidatePublicCafeListCache = async (): Promise<void> => {
+  if (!isRedisAvailable()) return;
+  try {
+    await redisIncr(redisKeys.publicCafesVersion());
+  } catch {
+    // Best-effort collection cache version bump
+  }
+};
+
+export const invalidatePublicMenuCaches = async (
+  cafeId: string,
+): Promise<void> => {
+  await cacheDeleteKeys(
+    redisKeys.publicMenu(cafeId, false),
+    redisKeys.publicMenu(cafeId, true),
+  );
+};
+
+export const invalidatePublicCafeCaches = async (
+  cafeId: string,
+): Promise<void> => {
+  await Promise.all([
+    cacheDeleteKeys(
+      redisKeys.publicCafe(cafeId),
+      redisKeys.cafeOrderableMeta(cafeId),
+      redisKeys.publicMenu(cafeId, false),
+      redisKeys.publicMenu(cafeId, true),
+    ),
+    invalidatePublicCafeListCache(),
+  ]);
+};
+
+export const getOrderableCafeMeta = async (
+  cafeId: Types.ObjectId | string,
+): Promise<OrderableCafeMeta | null> => {
+  const idStr = String(cafeId);
+  return getOrLoadCachedJson<OrderableCafeMeta | null>(
+    redisKeys.cafeOrderableMeta(idStr),
+    REDIS_TTLS.CAFE_ORDERABLE_META_SEC,
+    async () => {
+      const cafe = await Cafe.findById(idStr)
+        .select(
+          "name isOpen isApproved approvalStatus isVisible isActive deliveryEnabled pickupEnabled deliveryFee platformFee",
+        )
+        .lean<OrderableCafeMeta | null>();
+      return cafe;
+    },
+  );
+};
 
 /* =====================================================
    TYPES
@@ -273,6 +351,14 @@ export const createCafeService = async (
     throw new BadRequestError(`Missing documents: ${missing.join(", ")}`);
   }
 
+  const emailTaken = await Cafe.exists({
+    email: data.email,
+    ...(existing ? { _id: { $ne: existing._id } } : {}),
+  });
+  if (emailTaken) {
+    throw new ConflictError("A cafe with this email already exists");
+  }
+
   const base = `cafes/${ownerId}`;
 
   const [
@@ -368,13 +454,20 @@ export const createCafeService = async (
       cafeId = created._id as Types.ObjectId;
     }
 
+    await invalidateCafeIdCache(ownerId);
     return await Cafe.findById(cafeId).select("-documents");
   } catch (error: unknown) {
     const mongoError = error as {
       code?: number;
+      keyPattern?: Record<string, unknown>;
     };
 
     if (mongoError?.code === 11000) {
+      if (mongoError.keyPattern && "owner" in mongoError.keyPattern) {
+        throw new ConflictError(
+          "You have already submitted a cafe application",
+        );
+      }
       throw new ConflictError("A cafe with this email or code already exists");
     }
 
@@ -465,6 +558,14 @@ export const setCafeOpenService = async (
     );
   }
 
+  await invalidatePublicCafeCaches(String(cafe._id));
+
+  emitCafeOpenStatusEvent({
+    cafeId: String(cafe._id),
+    name: cafe.name,
+    isOpen: cafe.isOpen,
+  });
+
   return cafe;
 };
 
@@ -488,16 +589,22 @@ export const listPublicCafesService = async (query: {
   };
 
   if (query.city?.trim()) {
-    const escapedCity = query.city
-      .trim()
-      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const city = query.city.trim();
+    if (city.length > 100) {
+      throw new BadRequestError("City filter cannot exceed 100 characters");
+    }
+    const escapedCity = city.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
     filter.city = new RegExp(`^${escapedCity}$`, "i");
   }
 
   if (query.search?.trim()) {
+    const search = query.search.trim();
+    if (search.length > 100) {
+      throw new BadRequestError("Search query cannot exceed 100 characters");
+    }
     filter.$text = {
-      $search: query.search.trim(),
+      $search: search,
     };
   }
 
@@ -517,26 +624,50 @@ export const listPublicCafesService = async (query: {
     "platformFee",
   ].join(" ");
 
-  const [items, total] = await Promise.all([
-    Cafe.find(filter)
-      .select(fields)
-      .sort({
-        isOpen: -1,
-        "rating.average": -1,
-      })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
+  const normalizedCity = query.city?.trim().toLowerCase() || "";
+  const normalizedSearch = query.search?.trim().toLowerCase() || "";
+  const queryHash = crypto
+    .createHash("sha256")
+    .update(`${normalizedCity}|${normalizedSearch}|${page}|${limit}`)
+    .digest("hex")
+    .slice(0, 24);
 
-    Cafe.countDocuments(filter),
-  ]);
+  let version = "1";
+  if (isRedisAvailable()) {
+    try {
+      version = (await redisGet(redisKeys.publicCafesVersion())) || "1";
+    } catch {
+      version = "1";
+    }
+  }
 
-  return {
-    items,
-    total,
-    page,
-    pages: Math.ceil(total / limit),
-  };
+  return getOrLoadCachedJson(
+    redisKeys.publicCafesList(version, queryHash),
+    REDIS_TTLS.PUBLIC_CAFE_LIST_SEC,
+    async () => {
+      const items = await Cafe.find(filter)
+        .select(fields)
+        .sort({
+          isOpen: -1,
+          "rating.average": -1,
+        })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean();
+
+      const total =
+        page === 1 && items.length < limit
+          ? items.length
+          : await Cafe.countDocuments(filter);
+
+      return {
+        items,
+        total,
+        page,
+        pages: Math.ceil(total / limit),
+      };
+    },
+  );
 };
 
 /* =====================================================
@@ -547,38 +678,46 @@ export const getPublicCafeService = async (id: string) => {
     throw new BadRequestError("Invalid cafe ID");
   }
 
-  const cafe = await Cafe.findOne({
-    _id: id,
-    isApproved: true,
-    approvalStatus: "approved",
-    isVisible: true,
-    isActive: true,
-  }).select(
-    [
-      "name",
-      "description",
-      "logo",
-      "coverImage",
-      "galleryImages",
-      "city",
-      "state",
-      "address",
-      "landmark",
-      "pincode",
-      "rating",
-      "isOpen",
-      "deliveryEnabled",
-      "pickupEnabled",
-      "deliveryFee",
-      "platformFee",
-    ].join(" "),
+  return getOrLoadCachedJson(
+    redisKeys.publicCafe(id),
+    REDIS_TTLS.PUBLIC_CAFE_CACHE_SEC,
+    async () => {
+      const cafe = await Cafe.findOne({
+        _id: id,
+        isApproved: true,
+        approvalStatus: "approved",
+        isVisible: true,
+        isActive: true,
+      })
+        .select(
+          [
+            "name",
+            "description",
+            "logo",
+            "coverImage",
+            "galleryImages",
+            "city",
+            "state",
+            "address",
+            "landmark",
+            "pincode",
+            "rating",
+            "isOpen",
+            "deliveryEnabled",
+            "pickupEnabled",
+            "deliveryFee",
+            "platformFee",
+          ].join(" "),
+        )
+        .lean();
+
+      if (!cafe) {
+        throw new NotFoundError("Cafe not found");
+      }
+
+      return cafe;
+    },
   );
-
-  if (!cafe) {
-    throw new NotFoundError("Cafe not found");
-  }
-
-  return cafe;
 };
 
 /* =====================================================
@@ -807,7 +946,7 @@ export const approveCafeService = async (id: string) => {
       new: true,
       runValidators: true,
     },
-  ).select("name approvalStatus code");
+  ).select("name approvalStatus code owner");
 
   if (!cafe) {
     const exists = await Cafe.exists({
@@ -821,7 +960,26 @@ export const approveCafeService = async (id: string) => {
     throw new ConflictError("Only pending cafes can be approved");
   }
 
-  return cafe;
+  await invalidatePublicCafeCaches(String(cafe._id));
+
+  if (cafe.owner) {
+    emitCafeApprovalEvent(
+      {
+        cafeId: String(cafe._id),
+        name: cafe.name,
+        approvalStatus: "approved",
+        isApproved: true,
+      },
+      String(cafe.owner),
+    );
+  }
+
+  return {
+    _id: cafe._id,
+    name: cafe.name,
+    approvalStatus: cafe.approvalStatus,
+    code: cafe.code,
+  };
 };
 
 /* =====================================================
@@ -832,8 +990,12 @@ export const rejectCafeService = async (id: string, reason: string) => {
     throw new BadRequestError("Invalid cafe ID");
   }
 
-  if (!reason?.trim()) {
+  const trimmedReason = reason?.trim() ?? "";
+  if (!trimmedReason) {
     throw new BadRequestError("Rejection reason is required");
+  }
+  if (trimmedReason.length > 500) {
+    throw new BadRequestError("Rejection reason cannot exceed 500 characters");
   }
 
   const cafe = await Cafe.findOneAndUpdate(
@@ -844,7 +1006,7 @@ export const rejectCafeService = async (id: string, reason: string) => {
     {
       $set: {
         approvalStatus: "rejected",
-        rejectionReason: reason.trim(),
+        rejectionReason: trimmedReason,
         isApproved: false,
         isVisible: false,
         isOpen: false,
@@ -854,7 +1016,7 @@ export const rejectCafeService = async (id: string, reason: string) => {
       new: true,
       runValidators: true,
     },
-  ).select("name approvalStatus rejectionReason");
+  ).select("name approvalStatus rejectionReason owner");
 
   if (!cafe) {
     const exists = await Cafe.exists({
@@ -868,7 +1030,27 @@ export const rejectCafeService = async (id: string, reason: string) => {
     throw new ConflictError("Only pending cafes can be rejected");
   }
 
-  return cafe;
+  await invalidatePublicCafeCaches(String(cafe._id));
+
+  if (cafe.owner) {
+    emitCafeApprovalEvent(
+      {
+        cafeId: String(cafe._id),
+        name: cafe.name,
+        approvalStatus: "rejected",
+        isApproved: false,
+        rejectionReason: cafe.rejectionReason,
+      },
+      String(cafe.owner),
+    );
+  }
+
+  return {
+    _id: cafe._id,
+    name: cafe.name,
+    approvalStatus: cafe.approvalStatus,
+    rejectionReason: cafe.rejectionReason,
+  };
 };
 
 /* =====================================================
@@ -880,40 +1062,52 @@ export const getPublicMenuService = async (
 ) => {
   assertObjectId(cafeId, "cafe ID");
 
-  const cafe = await Cafe.findOne({
-    _id: cafeId,
-    isApproved: true,
-    approvalStatus: "approved",
-    isVisible: true,
-    isActive: true,
-  }).select("name isOpen");
+  return getOrLoadCachedJson(
+    redisKeys.publicMenu(cafeId, onlyOrderable),
+    REDIS_TTLS.PUBLIC_MENU_CACHE_SEC,
+    async () => {
+      const cafe = await Cafe.findOne({
+        _id: cafeId,
+        isApproved: true,
+        approvalStatus: "approved",
+        isVisible: true,
+        isActive: true,
+      })
+        .select("name isOpen")
+        .lean();
 
-  if (!cafe) throw new NotFoundError("Cafe not found");
+      if (!cafe) throw new NotFoundError("Cafe not found");
 
-  const filter: Record<string, unknown> = { cafe: cafeId, isAvailable: true };
-  if (onlyOrderable) Object.assign(filter, ORDERABLE);
+      const filter: Record<string, unknown> = {
+        cafe: cafeId,
+        isAvailable: true,
+      };
+      if (onlyOrderable) Object.assign(filter, ORDERABLE);
 
-  const items = await MenuItem.find(filter)
-    .select(
-      "name description price category image isVeg isAvailable trackStock stock",
-    )
-    .sort({ category: 1, name: 1 })
-    .lean();
+      const items = await MenuItem.find(filter)
+        .select(
+          "name description price category image isVeg isAvailable trackStock stock",
+        )
+        .sort({ category: 1, name: 1 })
+        .limit(500)
+        .lean();
 
-  const grouped: Record<string, unknown[]> = {};
+      const grouped: Record<string, unknown[]> = {};
 
-  for (const raw of items) {
-    const { stock, trackStock, ...rest } = withStatus(raw);
-    (grouped[raw.category] ??= []).push({ ...rest, trackStock: undefined });
-    void stock;
-    void trackStock;
-  }
+      for (const raw of items) {
+        const { stock, trackStock, ...rest } = withStatus(raw);
+        (grouped[raw.category] ??= []).push({ ...rest, trackStock: undefined });
+        void stock;
+        void trackStock;
+      }
 
-  return {
-    cafe: { _id: cafe._id, name: cafe.name, isOpen: cafe.isOpen },
-    menu: Object.entries(grouped).map(([category, items]) => ({
-      category,
-      items,
-    })),
-  };
+      return {
+        cafe: { _id: cafe._id, name: cafe.name, isOpen: cafe.isOpen },
+        menu: Object.entries(grouped).map(([category, items]) => ({
+          category,
+          items,
+        })),
+      };
+    },
+  );
 };

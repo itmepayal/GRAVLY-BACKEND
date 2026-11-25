@@ -1,3 +1,4 @@
+import { randomBytes } from "crypto";
 import { Schema, model, Document, Types } from "mongoose";
 import { IOrder } from "./order.model.js";
 import { IStudent } from "./student.model.js";
@@ -67,11 +68,31 @@ const paymentSchema = new Schema<IPayment>(
   { timestamps: true },
 );
 
-paymentSchema.pre("validate", async function (next) {
+paymentSchema.pre("validate", function () {
   if (!this.paymentId) {
-    const count = await model("Payment").countDocuments();
-    this.paymentId = `pay_${1001 + count}`;
+    this.paymentId = `pay_${Date.now().toString(36)}${randomBytes(3).toString("hex")}`;
   }
 });
+
+paymentSchema.index({ order: 1, createdAt: -1 });
+paymentSchema.index({ status: 1, amount: 1 });
+paymentSchema.index({ createdAt: -1, _id: -1 });
+paymentSchema.index({ status: 1, createdAt: -1, _id: -1 });
+paymentSchema.index(
+  { order: 1, method: 1 },
+  {
+    name: "uniq_order_pending_cashfree",
+    unique: true,
+    partialFilterExpression: { method: "cashfree", status: "pending" },
+  },
+);
+paymentSchema.index(
+  { order: 1, method: 1 },
+  {
+    name: "uniq_order_cash",
+    unique: true,
+    partialFilterExpression: { method: "cash" },
+  },
+);
 
 export const Payment = model<IPayment>("Payment", paymentSchema);

@@ -15,6 +15,7 @@ export interface IUser extends Document {
   phone?: string;
   isVerified: boolean;
   isActive: boolean;
+  tokenVersion: number;
   fcmTokens: string[];
   createdAt: Date;
   updatedAt: Date;
@@ -80,6 +81,12 @@ const userSchema = new Schema<IUser>(
       default: true,
     },
 
+    tokenVersion: {
+      type: Number,
+      default: 0,
+      required: true,
+    },
+
     fcmTokens: {
       type: [String],
       default: [],
@@ -97,5 +104,16 @@ userSchema.index(
     partialFilterExpression: { providerId: { $type: "string" } },
   },
 );
+
+userSchema.index(
+  { role: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { role: "admin" },
+  },
+);
+
+userSchema.index({ role: 1, isActive: 1, createdAt: -1 });
+userSchema.index({ createdAt: -1, _id: -1 });
 
 export const User = model<IUser>("User", userSchema);
