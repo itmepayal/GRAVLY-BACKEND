@@ -2,7 +2,7 @@ import type { Server as HttpServer } from "http";
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-adapter";
 import type { Redis } from "ioredis";
-import { corsOptions } from "../app/app.js";
+import { corsOptions } from "../config/cors.config.js";
 import { serverConfig } from "../config/index.js";
 import logger from "../config/logger.config.js";
 import {

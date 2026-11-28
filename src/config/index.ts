@@ -118,7 +118,7 @@ function parseCorsOrigins(rawCorsOrigin: string, clientUrl: string): string[] {
     .map((o) => o.trim().replace(/\/+$/, ""))
     .filter(Boolean);
 
-  if (candidates.length === 0 && clientUrl) {
+  if (clientUrl) {
     candidates.push(clientUrl.trim().replace(/\/+$/, ""));
   }
 
@@ -126,7 +126,7 @@ function parseCorsOrigins(rawCorsOrigin: string, clientUrl: string): string[] {
   for (const origin of candidates) {
     if (origin === "*") {
       throw new Error(
-        "Wildcard '*' is not permitted in CORS_ORIGIN when credentials are enabled",
+        "Wildcard '*' is not permitted in CORS_ORIGIN/CORS_ORIGINS when credentials are enabled",
       );
     }
     try {
@@ -283,7 +283,13 @@ function validateRedisEnv(nodeEnvValue: string): {
 
 const nodeEnv = process.env.NODE_ENV?.trim() || "development";
 const clientUrl = getEnv("CLIENT_URL");
-const corsOrigin = getEnv("CORS_ORIGIN");
+const corsOrigin =
+  process.env.CORS_ORIGINS?.trim() || process.env.CORS_ORIGIN?.trim() || "";
+if (!corsOrigin) {
+  throw new Error(
+    "Missing required environment variable: CORS_ORIGIN (or CORS_ORIGINS)",
+  );
+}
 const corsOrigins = parseCorsOrigins(corsOrigin, clientUrl);
 const validatedRedis = validateRedisEnv(nodeEnv);
 

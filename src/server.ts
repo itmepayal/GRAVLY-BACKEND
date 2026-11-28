@@ -182,16 +182,23 @@ const startServer = async (): Promise<void> => {
         operation: "UNHANDLED_REJECTION",
         error:
           reason instanceof Error
-            ? { name: reason.name, message: reason.message, stack: reason.stack }
+            ? {
+                name: reason.name,
+                message: reason.message,
+                stack: reason.stack,
+              }
             : String(reason),
       });
     });
 
     process.once("uncaughtException", (err: Error) => {
-      logger.error("Uncaught exception detected; initiating controlled shutdown", {
-        operation: "UNCAUGHT_EXCEPTION",
-        error: { name: err.name, message: err.message, stack: err.stack },
-      });
+      logger.error(
+        "Uncaught exception detected; initiating controlled shutdown",
+        {
+          operation: "UNCAUGHT_EXCEPTION",
+          error: { name: err.name, message: err.message, stack: err.stack },
+        },
+      );
       void shutdown("uncaughtException");
     });
   } catch (error: unknown) {

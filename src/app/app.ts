@@ -1,11 +1,16 @@
 import crypto from "crypto";
 import express, { Request, RequestHandler } from "express";
-import cors, { CorsOptions } from "cors";
+import cors from "cors";
 import helmet from "helmet";
 import swaggerUi from "swagger-ui-express";
 import mongoose from "mongoose";
 import logger, { runWithLogContext } from "../config/logger.config.js";
 import { serverConfig } from "../config/index.js";
+import {
+  corsOptions,
+  extractOrigin,
+  getAllowedOrigins,
+} from "../config/cors.config.js";
 import { swaggerSpec } from "../config/swagger.config.js";
 import v1Router from "../routers/v1/index.router.js";
 import {
@@ -17,75 +22,13 @@ import {
   genericErrorHandler,
 } from "../middlewares/error.middleware.js";
 import { multerErrorHandler } from "../middlewares/upload.middleware.js";
-import { ForbiddenError, NotFoundError } from "../utils/errors/app.error.js";
+import { NotFoundError } from "../utils/errors/app.error.js";
 
 import { getRedisHealthDetails } from "../config/redis.config.js";
 import { isRedisAvailable } from "../infrastructure/redis/index.js";
 import { getSocketHealthStatus } from "../socket/index.js";
 
-const devLocalOrigins = [
-  "http://localhost:3000",
-  "http://localhost:8081",
-  "http://localhost:8082",
-  "http://localhost:19006",
-  "http://localhost:8000",
-];
-
-const extractOrigin = (rawUrl?: string): string | null => {
-  if (!rawUrl || !rawUrl.trim()) return null;
-  try {
-    return new URL(rawUrl.trim()).origin;
-  } catch {
-    return null;
-  }
-};
-
-const getAllowedOrigins = (): string[] => {
-  const configured = [...serverConfig.CORS_ORIGINS];
-  for (const candidate of [
-    extractOrigin(serverConfig.SERVER_URL),
-    extractOrigin(serverConfig.API_BASE_URL),
-    ...(serverConfig.NODE_ENV === "production"
-      ? ["https://gravly-backend-api.onrender.com"]
-      : []),
-  ]) {
-    if (candidate) configured.push(candidate);
-  }
-  if (serverConfig.NODE_ENV !== "production") {
-    configured.push(...devLocalOrigins);
-  }
-  return Array.from(new Set(configured));
-};
-
-export const corsOptions: CorsOptions = {
-  origin(origin, callback) {
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    const normalizedOrigin = origin.trim().replace(/\/+$/, "");
-    const allowed = getAllowedOrigins();
-
-    if (allowed.includes(normalizedOrigin)) {
-      return callback(null, true);
-    }
-
-    logger.warn("Blocked CORS origin", { origin: normalizedOrigin });
-    return callback(new ForbiddenError("CORS origin not allowed"));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-Requested-With",
-    "X-Request-ID",
-    "X-Swagger-Key",
-    "Idempotency-Key",
-  ],
-  exposedHeaders: ["X-Request-ID"],
-  maxAge: 600,
-};
+export { corsOptions };
 
 const resolveTrustProxy = (): boolean | number | string => {
   const raw = process.env.TRUST_PROXY?.trim();
@@ -109,9 +52,47 @@ export const isServerDraining = (): boolean => serverDraining;
 export const createApp = (): express.Application => {
   const app = express();
 
+  // 1. Security and proxy configuration
   app.disable("x-powered-by");
   app.set("trust proxy", resolveTrustProxy());
 
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'"],
+          styleSrc: ["'self'"],
+          imgSrc: ["'self'", "data:", "https:"],
+          connectSrc: ["'self'", ...getAllowedOrigins()],
+          fontSrc: ["'self'", "data:"],
+          objectSrc: ["'none'"],
+          frameAncestors: ["'none'"],
+          baseUri: ["'self'"],
+          formAction: ["'self'"],
+        },
+      },
+      hsts:
+        serverConfig.NODE_ENV === "production"
+          ? {
+              maxAge: 31536000,
+              includeSubDomains: true,
+              preload: false,
+            }
+          : false,
+      frameguard: { action: "deny" },
+      noSniff: true,
+      referrerPolicy: { policy: "no-referrer" },
+      crossOriginOpenerPolicy: { policy: "same-origin" },
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+  );
+
+  // 2 & 3. Centralized CORS middleware and OPTIONS preflight handling
+  app.use(cors(corsOptions));
+  app.options(/.*/, cors(corsOptions));
+
+  // 4. Request ID and logging middleware
   app.use((req, res, next) => {
     const incoming = req.headers["x-request-id"];
     const sanitized =
@@ -185,38 +166,17 @@ export const createApp = (): express.Application => {
     );
   });
 
+  // 5. Body parsing
   app.use(
-    helmet({
-      contentSecurityPolicy: {
-        directives: {
-          defaultSrc: ["'self'"],
-          scriptSrc: ["'self'"],
-          styleSrc: ["'self'"],
-          imgSrc: ["'self'", "data:", "https:"],
-          connectSrc: ["'self'", ...getAllowedOrigins()],
-          fontSrc: ["'self'", "data:"],
-          objectSrc: ["'none'"],
-          frameAncestors: ["'none'"],
-          baseUri: ["'self'"],
-          formAction: ["'self'"],
-        },
+    express.json({
+      limit: "1mb",
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: string }).rawBody = buf.toString("utf8");
       },
-      hsts:
-        serverConfig.NODE_ENV === "production"
-          ? {
-              maxAge: 31536000,
-              includeSubDomains: true,
-              preload: false,
-            }
-          : false,
-      frameguard: { action: "deny" },
-      noSniff: true,
-      referrerPolicy: { policy: "no-referrer" },
-      crossOriginOpenerPolicy: { policy: "same-origin" },
-      crossOriginResourcePolicy: { policy: "cross-origin" },
     }),
   );
 
+  // Health & readiness probes
   app.get("/health", async (_req, res) => {
     const dbConnected = mongoose.connection.readyState === 1;
     const [redisDetails, socketStatus] = await Promise.all([
@@ -281,18 +241,6 @@ export const createApp = (): express.Application => {
   app.get("/live", (_req, res) => {
     res.status(200).json({ success: true, live: true });
   });
-
-  app.use(cors(corsOptions));
-  app.options(/.*/, cors(corsOptions));
-
-  app.use(
-    express.json({
-      limit: "1mb",
-      verify: (req, _res, buf) => {
-        (req as Request & { rawBody?: string }).rawBody = buf.toString("utf8");
-      },
-    }),
-  );
 
   const safeKeyEquals = (a: string, b: string): boolean => {
     const hashA = crypto.createHash("sha256").update(a, "utf8").digest();
