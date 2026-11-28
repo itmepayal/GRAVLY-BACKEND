@@ -1,5 +1,4 @@
 import fs from "fs";
-import dotenv from "dotenv";
 import { v2 as cloudinary } from "cloudinary";
 import type { UploadApiOptions, UploadApiResponse } from "cloudinary";
 
@@ -11,8 +10,6 @@ import { assertValidImageMagicBytes } from "../middlewares/upload.middleware.js"
 export const DEFAULT_SIGNED_URL_TTL_SEC = 300;
 const MIN_SIGNED_URL_TTL_SEC = 60;
 const MAX_SIGNED_URL_TTL_SEC = 3600;
-
-dotenv.config();
 
 /* =====================================================
    TYPES

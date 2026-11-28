@@ -1,5 +1,4 @@
 import mongoose, { ClientSession } from "mongoose";
-import "dotenv/config";
 
 import { serverConfig } from "./index.js";
 import logger from "./logger.config.js";
