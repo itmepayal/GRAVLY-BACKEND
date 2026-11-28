@@ -14,7 +14,14 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
-import { upload } from "../../middlewares/upload.middleware.js";
+import {
+  cafeOwnerLimiter,
+  uploadLimiter,
+} from "../../middlewares/rateLimiter.middleware.js";
+import {
+  upload,
+  validateUploadedImagesMiddleware,
+} from "../../middlewares/upload.middleware.js";
 
 const router = Router();
 
@@ -22,7 +29,7 @@ export const publicMenuRouter = Router();
 
 const imageUpload = upload.fields([{ name: "image", maxCount: 1 }]);
 
-const ownerOnly = [authenticate, authorize("cafeOwner")];
+const ownerOnly = [authenticate, authorize("cafeOwner"), cafeOwnerLimiter];
 
 /**
  * @openapi
@@ -66,7 +73,14 @@ const ownerOnly = [authenticate, authorize("cafeOwner")];
  *       409:
  *         $ref: '#/components/responses/Conflict'
  */
-router.post("/", ...ownerOnly, imageUpload, createMenuItem);
+router.post(
+  "/",
+  ...ownerOnly,
+  uploadLimiter,
+  imageUpload,
+  validateUploadedImagesMiddleware,
+  createMenuItem,
+);
 
 /**
  * @openapi
@@ -169,7 +183,14 @@ router.get("/me", ...ownerOnly, listMyMenu);
  *       409:
  *         $ref: '#/components/responses/Conflict'
  */
-router.patch("/:id", ...ownerOnly, imageUpload, updateMenuItem);
+router.patch(
+  "/:id",
+  ...ownerOnly,
+  uploadLimiter,
+  imageUpload,
+  validateUploadedImagesMiddleware,
+  updateMenuItem,
+);
 
 /**
  * @openapi

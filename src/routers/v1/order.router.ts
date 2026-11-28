@@ -18,6 +18,10 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
+import {
+  orderReadLimiter,
+  orderWriteLimiter,
+} from "../../middlewares/rateLimiter.middleware.js";
 
 const STUDENT = "student";
 const CAFE_OWNER = "cafeOwner";
@@ -81,6 +85,14 @@ const studentOnly = [authenticate, authorize(STUDENT)];
  *     responses:
  *       200:
  *         description: Orders retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Cafe orders fetched successfully }
+ *                 data: { $ref: '#/components/schemas/OrderListView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -92,7 +104,7 @@ const studentOnly = [authenticate, authorize(STUDENT)];
  *       500:
  *         description: Internal server error
  */
-router.get("/cafe", ...cafeOnly, getCafeOrders);
+router.get("/cafe", ...cafeOnly, orderReadLimiter, getCafeOrders);
 
 /**
  * @openapi
@@ -110,6 +122,14 @@ router.get("/cafe", ...cafeOnly, getCafeOrders);
  *     responses:
  *       200:
  *         description: Summary retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Summary fetched successfully }
+ *                 data: { $ref: '#/components/schemas/CafeOrderSummaryView' }
  *       401:
  *         $ref: '#/components/responses/Unauthorized'
  *       403:
@@ -119,7 +139,7 @@ router.get("/cafe", ...cafeOnly, getCafeOrders);
  *       500:
  *         description: Internal server error
  */
-router.get("/cafe/summary", ...cafeOnly, getCafeOrderSummary);
+router.get("/cafe/summary", ...cafeOnly, orderReadLimiter, getCafeOrderSummary);
 
 /**
  * @openapi
@@ -150,6 +170,14 @@ router.get("/cafe/summary", ...cafeOnly, getCafeOrderSummary);
  *     responses:
  *       200:
  *         description: Transaction history retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Transaction history fetched successfully }
+ *                 data: { $ref: '#/components/schemas/CafeOrderHistoryView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -161,7 +189,7 @@ router.get("/cafe/summary", ...cafeOnly, getCafeOrderSummary);
  *       500:
  *         description: Internal server error
  */
-router.get("/cafe/history", ...cafeOnly, getCafeOrderHistory);
+router.get("/cafe/history", ...cafeOnly, orderReadLimiter, getCafeOrderHistory);
 
 /**
  * @openapi
@@ -185,6 +213,14 @@ router.get("/cafe/history", ...cafeOnly, getCafeOrderHistory);
  *     responses:
  *       200:
  *         description: Order details retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order details fetched successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -196,7 +232,7 @@ router.get("/cafe/history", ...cafeOnly, getCafeOrderHistory);
  *       500:
  *         description: Internal server error
  */
-router.get("/cafe/:orderId", ...cafeOnly, getCafeOrder);
+router.get("/cafe/:orderId", ...cafeOnly, orderReadLimiter, getCafeOrder);
 
 /**
  * @openapi
@@ -218,6 +254,14 @@ router.get("/cafe/:orderId", ...cafeOnly, getCafeOrder);
  *     responses:
  *       200:
  *         description: Order accepted successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order accepted successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -231,7 +275,7 @@ router.get("/cafe/:orderId", ...cafeOnly, getCafeOrder);
  *       500:
  *         description: Internal server error
  */
-router.patch("/cafe/:orderId/accept", ...cafeOnly, acceptOrder);
+router.patch("/cafe/:orderId/accept", ...cafeOnly, orderWriteLimiter, acceptOrder);
 
 /**
  * @openapi
@@ -267,6 +311,14 @@ router.patch("/cafe/:orderId/accept", ...cafeOnly, acceptOrder);
  *     responses:
  *       200:
  *         description: Order rejected successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order rejected successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -280,7 +332,7 @@ router.patch("/cafe/:orderId/accept", ...cafeOnly, acceptOrder);
  *       500:
  *         description: Internal server error
  */
-router.patch("/cafe/:orderId/reject", ...cafeOnly, rejectOrder);
+router.patch("/cafe/:orderId/reject", ...cafeOnly, orderWriteLimiter, rejectOrder);
 
 /**
  * @openapi
@@ -316,6 +368,14 @@ router.patch("/cafe/:orderId/reject", ...cafeOnly, rejectOrder);
  *     responses:
  *       200:
  *         description: Order status updated successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order status updated successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -329,7 +389,7 @@ router.patch("/cafe/:orderId/reject", ...cafeOnly, rejectOrder);
  *       500:
  *         description: Internal server error
  */
-router.patch("/cafe/:orderId/status", ...cafeOnly, updateOrderStatus);
+router.patch("/cafe/:orderId/status", ...cafeOnly, orderWriteLimiter, updateOrderStatus);
 
 /* =====================================================
    STUDENT ROUTES
@@ -349,9 +409,23 @@ router.patch("/cafe/:orderId/status", ...cafeOnly, updateOrderStatus);
  *       For online payments, initiate payment using POST /payments/initiate.
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: header
+ *         name: Idempotency-Key
+ *         required: false
+ *         schema: { type: string }
+ *         description: Optional idempotency key to avoid duplicate order placement on retries
  *     responses:
  *       201:
  *         description: Order placed successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order placed successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -365,7 +439,7 @@ router.patch("/cafe/:orderId/status", ...cafeOnly, updateOrderStatus);
  *       500:
  *         description: Internal server error
  */
-router.post("/", ...studentOnly, placeOrder);
+router.post("/", ...studentOnly, orderWriteLimiter, placeOrder);
 
 /**
  * @openapi
@@ -403,6 +477,14 @@ router.post("/", ...studentOnly, placeOrder);
  *     responses:
  *       200:
  *         description: Orders retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Cafe orders fetched successfully }
+ *                 data: { $ref: '#/components/schemas/OrderListView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -412,7 +494,7 @@ router.post("/", ...studentOnly, placeOrder);
  *       500:
  *         description: Internal server error
  */
-router.get("/", ...studentOnly, getMyOrders);
+router.get("/", ...studentOnly, orderReadLimiter, getMyOrders);
 
 /**
  * @openapi
@@ -436,6 +518,14 @@ router.get("/", ...studentOnly, getMyOrders);
  *     responses:
  *       200:
  *         description: Order details retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order details fetched successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -447,7 +537,7 @@ router.get("/", ...studentOnly, getMyOrders);
  *       500:
  *         description: Internal server error
  */
-router.get("/:orderId", ...studentOnly, getMyOrder);
+router.get("/:orderId", ...studentOnly, orderReadLimiter, getMyOrder);
 
 /**
  * @openapi
@@ -473,6 +563,14 @@ router.get("/:orderId", ...studentOnly, getMyOrder);
  *     responses:
  *       200:
  *         description: Order cancelled successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Order cancelled successfully }
+ *                 data: { $ref: '#/components/schemas/OrderView' }
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  *       401:
@@ -486,6 +584,6 @@ router.get("/:orderId", ...studentOnly, getMyOrder);
  *       500:
  *         description: Internal server error
  */
-router.patch("/:orderId/cancel", ...studentOnly, cancelMyOrder);
+router.patch("/:orderId/cancel", ...studentOnly, orderWriteLimiter, cancelMyOrder);
 
 export default router;

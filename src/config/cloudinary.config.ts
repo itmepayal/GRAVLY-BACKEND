@@ -6,6 +6,11 @@ import type { UploadApiOptions, UploadApiResponse } from "cloudinary";
 import { serverConfig } from "./index.js";
 import { BadRequestError } from "../utils/errors/app.error.js";
 import { logger } from "./logger.config.js";
+import { assertValidImageMagicBytes } from "../middlewares/upload.middleware.js";
+
+export const DEFAULT_SIGNED_URL_TTL_SEC = 300;
+const MIN_SIGNED_URL_TTL_SEC = 60;
+const MAX_SIGNED_URL_TTL_SEC = 3600;
 
 dotenv.config();
 
@@ -112,6 +117,8 @@ export const uploadImage = (
       if (!file?.buffer?.length) {
         return reject(new BadRequestError("Uploaded file is empty or missing"));
       }
+
+      assertValidImageMagicBytes(file.buffer, file.mimetype);
 
       const options: UploadApiOptions = {
         folder,
@@ -228,19 +235,39 @@ export const uploadToCloudinary = async (
 /* =====================================================
    GENERATE SIGNED URL FOR PRIVATE IMAGE
 ===================================================== */
-export const signedUrl = (publicId: string): string => {
+export const signedUrl = (
+  publicId: string,
+  ttlSeconds = DEFAULT_SIGNED_URL_TTL_SEC,
+  format = "",
+): string => {
   if (!publicId?.trim()) {
     throw new BadRequestError("Cloudinary public ID is required");
   }
 
   validateCloudinaryConfig();
 
-  return cloudinary.url(publicId, {
-    resource_type: "image",
-    type: "authenticated",
-    sign_url: true,
-    secure: true,
-  });
+  const clampedTtl = Math.min(
+    MAX_SIGNED_URL_TTL_SEC,
+    Math.max(
+      MIN_SIGNED_URL_TTL_SEC,
+      Number.isFinite(ttlSeconds)
+        ? Math.floor(ttlSeconds)
+        : DEFAULT_SIGNED_URL_TTL_SEC,
+    ),
+  );
+
+  const expiresAt = Math.floor(Date.now() / 1000) + clampedTtl;
+
+  return cloudinary.utils.private_download_url(
+    publicId,
+    format.replace(/^\./, "").trim(),
+    {
+      resource_type: "image",
+      type: "authenticated",
+      attachment: false,
+      expires_at: expiresAt,
+    },
+  );
 };
 
 /* =====================================================

@@ -101,6 +101,14 @@ export const registerCafeHandlers = (socket: AppSocket): void => {
 
       const room = ROOMS.cafe(parsed.data.cafeId);
       await socket.leave(room);
+      if (parsed.data.cafeId !== socket.data.cafeId) {
+        await socket.leave(ROOMS.cafePrivate(parsed.data.cafeId));
+      }
+      logger.debug("[socket] Left cafe room", {
+        userId: socket.data.userId,
+        cafeId: parsed.data.cafeId,
+        room,
+      });
       sendAck(callback, {
         ok: true,
         data: { room, cafeId: parsed.data.cafeId },

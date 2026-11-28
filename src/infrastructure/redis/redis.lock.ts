@@ -35,6 +35,11 @@ export const acquireDistributedLock = async (
     if (acquired === "OK") {
       return { key, token };
     }
+    logger.debug("[redis-lock] Distributed lock already held", {
+      key,
+      ttlSec: safeTtl,
+      operation: "REDIS_LOCK_CONTENDED",
+    });
     return null;
   } catch (err) {
     logger.warn("[redis-lock] Failed to acquire lock", {

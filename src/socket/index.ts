@@ -7,8 +7,10 @@ export type {
   AuthErrorPayload,
   AuthRevokedPayload,
   CafeApprovalEventPayload,
+  CafeMenuEventPayload,
   CafeOpenStatusEventPayload,
   CafeProfileEventPayload,
+  CartEventPayload,
   ClientToServerEvents,
   InterServerEvents,
   OrderEventPayload,
@@ -26,8 +28,10 @@ export {
 export type { SocketHealthStatus } from "./socket.server.js";
 export {
   emitCafeApprovalEvent,
+  emitCafeMenuUpdatedEvent,
   emitCafeOpenStatusEvent,
   emitCafeProfileEvent,
+  emitCartEvent,
   emitOrderCreatedToCafe,
   emitOrderEvent,
   emitPaymentEvent,

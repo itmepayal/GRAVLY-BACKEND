@@ -104,6 +104,11 @@ export const registerOrderHandlers = (socket: AppSocket): void => {
 
       const room = ROOMS.order(parsed.data.orderId);
       await socket.leave(room);
+      logger.debug("[socket] Left order room", {
+        userId: socket.data.userId,
+        orderId: parsed.data.orderId,
+        room,
+      });
       sendAck(callback, {
         ok: true,
         data: { room, orderId: parsed.data.orderId },

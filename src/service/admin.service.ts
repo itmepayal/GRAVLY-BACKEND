@@ -21,7 +21,7 @@ import {
 } from "../middlewares/authenticate.middleware.js";
 import { runWithOptionalTransaction } from "../config/db.config.js";
 import { hashPassword, verifyPassword } from "../utils/password/password.js";
-import { logSecurityAudit } from "../config/logger.config.js";
+import logger, { logSecurityAudit } from "../config/logger.config.js";
 import {
   REDIS_TTLS,
   getOrLoadCachedJson,
@@ -525,6 +525,12 @@ export const setUserActiveService = async (
     actorId: currentAdminId.toString(),
     success: true,
     reasonCode: isActive ? "ADMIN_ACTIVATED_USER" : "ADMIN_DEACTIVATED_USER",
+  });
+  logger.info("Admin updated user active status", {
+    targetUserId: id.toString(),
+    adminId: currentAdminId.toString(),
+    isActive,
+    operation: "ADMIN_SET_USER_ACTIVE",
   });
 
   return user;
@@ -1052,6 +1058,12 @@ export const updateAdminProfileService = async (
 
   await clearUserCache(id.toString());
 
+  logger.info("Admin profile updated", {
+    adminId: id.toString(),
+    updatedFields: Object.keys(update),
+    operation: "ADMIN_UPDATE_PROFILE",
+  });
+
   return admin;
 };
 
@@ -1162,6 +1174,10 @@ export const changeAdminPasswordService = async (
     actorId: admin._id.toString(),
     success: true,
     reasonCode: "ADMIN_PASSWORD_ROTATED",
+  });
+  logger.info("Admin password updated and sessions revoked", {
+    adminId: admin._id.toString(),
+    operation: "ADMIN_CHANGE_PASSWORD",
   });
 
   return {

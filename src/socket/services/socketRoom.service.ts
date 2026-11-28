@@ -1,6 +1,7 @@
 import { Order } from "../../models/order.model.js";
 import { Cafe } from "../../models/cafe.model.js";
 import { Student } from "../../models/student.model.js";
+import logger, { logSecurityAudit } from "../../config/logger.config.js";
 import type { AppSocket, SocketAck } from "../socket.types.js";
 import { ROOMS } from "../rooms/room.constants.js";
 
@@ -82,6 +83,16 @@ export const authorizeAndJoinOrderRoom = async (
   }
 
   if (!authorized) {
+    logSecurityAudit({
+      eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+      userId,
+      sessionId: socket.data.sid,
+      requestId: connectionId,
+      ip: socket.data.ip,
+      success: false,
+      reasonCode: "SOCKET_ORDER_ROOM_FORBIDDEN",
+      metadata: { orderId },
+    });
     return {
       ok: false,
       code: "FORBIDDEN",
@@ -92,6 +103,12 @@ export const authorizeAndJoinOrderRoom = async (
 
   const room = ROOMS.order(orderId);
   await socket.join(room);
+  logger.debug("[socket] Joined order room", {
+    userId,
+    orderId,
+    room,
+    socketId: socket.id,
+  });
   return { ok: true, data: { room, orderId }, requestId: connectionId };
 };
 
@@ -128,6 +145,16 @@ export const authorizeAndJoinCafeRoom = async (
     cafe.isActive;
 
   if (!isOwner && !isAdmin && !isPubliclyVisible) {
+    logSecurityAudit({
+      eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+      userId,
+      sessionId: socket.data.sid,
+      requestId: connectionId,
+      ip: socket.data.ip,
+      success: false,
+      reasonCode: "SOCKET_CAFE_ROOM_FORBIDDEN",
+      metadata: { cafeId },
+    });
     return {
       ok: false,
       code: "FORBIDDEN",
@@ -142,5 +169,12 @@ export const authorizeAndJoinCafeRoom = async (
   } else {
     await socket.join(room);
   }
+  logger.debug("[socket] Joined cafe room", {
+    userId,
+    cafeId,
+    room,
+    privateRoomJoined: isOwner || isAdmin,
+    socketId: socket.id,
+  });
   return { ok: true, data: { room, cafeId }, requestId: connectionId };
 };

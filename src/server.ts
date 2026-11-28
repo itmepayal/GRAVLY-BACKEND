@@ -2,7 +2,7 @@ import http, { type Server } from "http";
 
 import { connectDB } from "./config/db.config.js";
 import { initRedis, closeRedis } from "./config/redis.config.js";
-import logger from "./config/logger.config.js";
+import logger, { flushLoggers } from "./config/logger.config.js";
 import { serverConfig } from "./config/index.js";
 import createApp, { markServerDraining } from "./app/app.js";
 import { initSocketServer, closeSocketServer } from "./socket/index.js";
@@ -84,6 +84,7 @@ const shutdown = async (signal: string): Promise<void> => {
     clearTimeout(forceShutdownTimer);
 
     logger.info("Graceful shutdown completed.");
+    await flushLoggers(1500);
     process.exit(0);
   } catch (error: unknown) {
     clearTimeout(forceShutdownTimer);
@@ -99,6 +100,7 @@ const shutdown = async (signal: string): Promise<void> => {
           : error,
     });
 
+    await flushLoggers(1000);
     process.exit(1);
   }
 };
@@ -173,6 +175,24 @@ const startServer = async (): Promise<void> => {
 
     process.once("SIGINT", () => {
       void shutdown("SIGINT");
+    });
+
+    process.on("unhandledRejection", (reason: unknown) => {
+      logger.error("Unhandled promise rejection detected", {
+        operation: "UNHANDLED_REJECTION",
+        error:
+          reason instanceof Error
+            ? { name: reason.name, message: reason.message, stack: reason.stack }
+            : String(reason),
+      });
+    });
+
+    process.once("uncaughtException", (err: Error) => {
+      logger.error("Uncaught exception detected; initiating controlled shutdown", {
+        operation: "UNCAUGHT_EXCEPTION",
+        error: { name: err.name, message: err.message, stack: err.stack },
+      });
+      void shutdown("uncaughtException");
     });
   } catch (error: unknown) {
     logger.error("Application startup failed.", {

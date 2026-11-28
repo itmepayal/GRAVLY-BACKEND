@@ -1,5 +1,7 @@
 import crypto from "crypto";
-import logger from "../../config/logger.config.js";
+import net from "net";
+import { serverConfig } from "../../config/index.js";
+import logger, { logSecurityAudit } from "../../config/logger.config.js";
 import { verifyAuthenticatedCredential } from "../../middlewares/authenticate.middleware.js";
 import {
   resolveOptionalCafeIdByUserId,
@@ -8,9 +10,41 @@ import {
 import type { AppSocket } from "../socket.types.js";
 import { allowSocketHandshake } from "../services/socketRateLimit.service.js";
 
+const normalizeIp = (rawIp: string): string => {
+  const trimmed = rawIp.trim();
+  return trimmed.startsWith("::ffff:") ? trimmed.slice(7) : trimmed;
+};
+
 const extractSocketIp = (socket: AppSocket): string => {
-  const rawIp = socket.handshake.address || "unknown";
-  return rawIp.startsWith("::ffff:") ? rawIp.slice(7) : rawIp;
+  const directIp = normalizeIp(socket.handshake.address || "unknown");
+  const trustProxy = serverConfig.TRUST_PROXY;
+
+  if (!trustProxy) {
+    return directIp;
+  }
+
+  const forwardedHeader = socket.handshake.headers["x-forwarded-for"];
+  const rawForwarded = Array.isArray(forwardedHeader)
+    ? forwardedHeader.join(",")
+    : forwardedHeader;
+
+  if (typeof rawForwarded === "string" && rawForwarded.trim().length > 0) {
+    const chain = rawForwarded
+      .split(",")
+      .map((part) => normalizeIp(part))
+      .filter((ip) => ip.length > 0 && net.isIP(ip) > 0);
+
+    if (chain.length > 0) {
+      const hops =
+        typeof trustProxy === "number" && Number.isInteger(trustProxy) && trustProxy > 0
+          ? trustProxy
+          : 1;
+      const candidateIndex = Math.max(0, chain.length - hops);
+      return chain[candidateIndex] ?? directIp;
+    }
+  }
+
+  return directIp;
 };
 
 const extractSocketToken = (socket: AppSocket): string | null => {
@@ -58,12 +92,26 @@ export const socketAuthMiddleware = async (
     const allowed = await allowSocketHandshake(ip);
     if (!allowed) {
       logger.warn("[socket] Handshake rate limited", { connectionId, ip });
+      logSecurityAudit({
+        eventType: "RATE_LIMIT_TRIGGERED",
+        requestId: connectionId,
+        ip,
+        success: false,
+        reasonCode: "SOCKET_HANDSHAKE_RATE_LIMITED",
+      });
       next(new Error("RATE_LIMITED: Too many WebSocket connection attempts"));
       return;
     }
 
     const token = extractSocketToken(socket);
     if (!token) {
+      logSecurityAudit({
+        eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+        requestId: connectionId,
+        ip,
+        success: false,
+        reasonCode: "SOCKET_MISSING_TOKEN",
+      });
       next(new Error("UNAUTHORIZED: Access token required"));
       return;
     }
@@ -75,6 +123,16 @@ export const socketAuthMiddleware = async (
     });
 
     if (!verified.ok) {
+      logSecurityAudit({
+        eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+        requestId: connectionId,
+        ip,
+        success: false,
+        reasonCode:
+          verified.statusCode === 503
+            ? "SOCKET_AUTH_SERVICE_UNAVAILABLE"
+            : "SOCKET_AUTH_REJECTED",
+      });
       const code =
         verified.statusCode === 503 ? "SERVICE_UNAVAILABLE" : "UNAUTHORIZED";
       next(new Error(`${code}: ${verified.message}`));

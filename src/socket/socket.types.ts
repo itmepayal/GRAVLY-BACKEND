@@ -82,6 +82,32 @@ export interface CafeProfileEventPayload {
   emittedAt: string;
 }
 
+export interface CafeMenuEventPayload {
+  eventId: string;
+  cafeId: string;
+  menuItemId: string;
+  action: "created" | "updated" | "availability_toggled" | "stock_updated" | "deleted";
+  isAvailable?: boolean;
+  stock?: number;
+  emittedAt: string;
+}
+
+export interface CartEventPayload {
+  eventId: string;
+  studentId: string;
+  cartId?: string;
+  cafeId?: string | null;
+  itemCount: number;
+  totalAmount: number;
+  action:
+    | "item_added"
+    | "item_updated"
+    | "item_removed"
+    | "options_updated"
+    | "cleared";
+  emittedAt: string;
+}
+
 export interface ClientToServerEvents {
   [SOCKET_EVENTS.AUTH_REFRESH]: (
     payload: unknown,
@@ -130,9 +156,12 @@ export interface ServerToClientEvents {
   [SOCKET_EVENTS.CAFE_OPEN_STATUS_CHANGED]: (
     payload: CafeOpenStatusEventPayload,
   ) => void;
+  [SOCKET_EVENTS.CAFE_MENU_UPDATED]: (payload: CafeMenuEventPayload) => void;
   [SOCKET_EVENTS.CAFE_PROFILE_UPDATED]: (
     payload: CafeProfileEventPayload,
   ) => void;
+  [SOCKET_EVENTS.CART_UPDATED]: (payload: CartEventPayload) => void;
+  [SOCKET_EVENTS.CART_CLEARED]: (payload: CartEventPayload) => void;
 }
 
 export interface InterServerEvents {

@@ -47,6 +47,7 @@ export interface IOrder extends Document {
   paymentMethod: "online" | "cash";
   paymentStatus: "pending" | "paid" | "failed" | "refunded";
   paymentId?: Types.ObjectId | IPayment;
+  stockReleased: boolean;
 
   completedAt?: Date;
   createdAt: Date;
@@ -123,6 +124,7 @@ const orderSchema = new Schema<IOrder>(
       default: "pending",
     },
     paymentId: { type: Schema.Types.ObjectId, ref: "Payment" },
+    stockReleased: { type: Boolean, default: false },
 
     completedAt: { type: Date },
   },

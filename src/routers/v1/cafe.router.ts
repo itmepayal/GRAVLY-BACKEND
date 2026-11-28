@@ -18,7 +18,18 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
-import { upload } from "../../middlewares/upload.middleware.js";
+import {
+  adminMutationLimiter,
+  adminReadLimiter,
+  cafeOwnerLimiter,
+  publicReadLimiter,
+  publicSearchLimiter,
+  uploadLimiter,
+} from "../../middlewares/rateLimiter.middleware.js";
+import {
+  upload,
+  validateUploadedImagesMiddleware,
+} from "../../middlewares/upload.middleware.js";
 
 const router = Router();
 
@@ -65,7 +76,7 @@ const router = Router();
  *       400:
  *         $ref: '#/components/responses/BadRequest'
  */
-router.get("/", listPublicCafes);
+router.get("/", publicReadLimiter, publicSearchLimiter, listPublicCafes);
 
 /**
  * @openapi
@@ -110,7 +121,13 @@ router.get("/", listPublicCafes);
  *       403:
  *         $ref: '#/components/responses/Forbidden'
  */
-router.get("/admin", authenticate, authorize("admin"), listCafesAdmin);
+router.get(
+  "/admin",
+  authenticate,
+  authorize("admin"),
+  adminReadLimiter,
+  listCafesAdmin,
+);
 
 /**
  * @openapi
@@ -181,6 +198,7 @@ router.get(
   "/admin/pending",
   authenticate,
   authorize("admin"),
+  adminReadLimiter,
   listPendingCafes,
 );
 
@@ -220,7 +238,13 @@ router.get(
  *       404:
  *         $ref: '#/components/responses/NotFound'
  */
-router.get("/admin/:id", authenticate, authorize("admin"), getCafeAdmin);
+router.get(
+  "/admin/:id",
+  authenticate,
+  authorize("admin"),
+  adminReadLimiter,
+  getCafeAdmin,
+);
 
 /**
  * @openapi
@@ -228,7 +252,7 @@ router.get("/admin/:id", authenticate, authorize("admin"), getCafeAdmin);
  *   patch:
  *     tags: [Cafes - Admin]
  *     summary: Approve a pending cafe
- *     description: Only cafes with status "pending" can be approved. A unique cafe code is generated and the cafe becomes visible. The cafe stays closed until the admin opens it.
+ *     description: Only cafes with status "pending" can be approved. A unique cafe code is generated and the cafe becomes visible. The cafe stays closed until the cafe owner opens it.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -264,6 +288,7 @@ router.patch(
   "/admin/:id/approve",
   authenticate,
   authorize("admin"),
+  adminMutationLimiter,
   approveCafe,
 );
 
@@ -316,62 +341,12 @@ router.patch(
  *       409:
  *         $ref: '#/components/responses/Conflict'
  */
-router.patch("/admin/:id/reject", authenticate, authorize("admin"), rejectCafe);
-
-/**
- * @openapi
- * /cafes/admin/{id}/open-status:
- *   patch:
- *     tags: [Cafes - Admin]
- *     summary: Open or close a cafe
- *     description: Only the admin can open or close a cafe. Only approved cafes can be opened or closed.
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema: { type: string }
- *         description: Cafe ID
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [isOpen]
- *             properties:
- *               isOpen:
- *                 type: boolean
- *                 example: true
- *     responses:
- *       200:
- *         description: Cafe open status updated
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success: { type: boolean, example: true }
- *                 message: { type: string, example: Cafe is now open }
- *                 data:
- *                   $ref: '#/components/schemas/CafeOpenStatus'
- *       400:
- *         $ref: '#/components/responses/BadRequest'
- *       401:
- *         $ref: '#/components/responses/Unauthorized'
- *       403:
- *         $ref: '#/components/responses/Forbidden'
- *       404:
- *         $ref: '#/components/responses/NotFound'
- *       409:
- *         $ref: '#/components/responses/Conflict'
- */
 router.patch(
-  "/admin/:id/open-status",
+  "/admin/:id/reject",
   authenticate,
   authorize("admin"),
-  setCafeOpen,
+  adminMutationLimiter,
+  rejectCafe,
 );
 
 /**
@@ -400,7 +375,68 @@ router.patch(
  *       403:
  *         $ref: '#/components/responses/Forbidden'
  */
-router.get("/me", authenticate, authorize("cafeOwner"), getMyCafe);
+router.get(
+  "/me",
+  authenticate,
+  authorize("cafeOwner"),
+  cafeOwnerLimiter,
+  getMyCafe,
+);
+
+/**
+ * @openapi
+ * /cafes/owner/open-status:
+ *   patch:
+ *     tags: [Cafes - Owner]
+ *     summary: Open or close my cafe
+ *     description: |
+ *       Allows the authenticated Cafe Owner to open (`isOpen: true`) or close (`isOpen: false`) their own cafe.
+ *       The target cafe is resolved strictly from the authenticated user identity.
+ *       Only approved and active cafes can be opened or closed.
+ *       Closing a cafe blocks new cart additions and new orders, while allowing existing in-progress orders to complete normally.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [isOpen]
+ *             properties:
+ *               isOpen:
+ *                 type: boolean
+ *                 example: true
+ *     responses:
+ *       200:
+ *         description: Cafe open status updated successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Cafe is now open }
+ *                 data:
+ *                   $ref: '#/components/schemas/CafeOpenStatus'
+ *       400:
+ *         $ref: '#/components/responses/BadRequest'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       403:
+ *         $ref: '#/components/responses/Forbidden'
+ *       404:
+ *         $ref: '#/components/responses/NotFound'
+ *       409:
+ *         $ref: '#/components/responses/Conflict'
+ */
+router.patch(
+  "/owner/open-status",
+  authenticate,
+  authorize("cafeOwner"),
+  cafeOwnerLimiter,
+  setCafeOpen,
+);
 
 /**
  * @openapi
@@ -447,6 +483,8 @@ router.post(
   "/",
   authenticate,
   authorize("cafeOwner"),
+  cafeOwnerLimiter,
+  uploadLimiter,
   upload.fields([
     { name: "logo", maxCount: 1 },
     { name: "coverImage", maxCount: 1 },
@@ -458,6 +496,7 @@ router.post(
     { name: "foodLicense", maxCount: 1 },
     { name: "cancelledCheque", maxCount: 1 },
   ]),
+  validateUploadedImagesMiddleware,
   createCafe,
 );
 
@@ -500,7 +539,7 @@ router.post(
  *       404:
  *         $ref: '#/components/responses/NotFound'
  */
-router.get("/:cafeId/menu", getPublicMenu);
+router.get("/:cafeId/menu", publicReadLimiter, getPublicMenu);
 
 /**
  * @openapi
@@ -531,6 +570,6 @@ router.get("/:cafeId/menu", getPublicMenu);
  *       404:
  *         $ref: '#/components/responses/NotFound'
  */
-router.get("/:id", getPublicCafe);
+router.get("/:id", publicReadLimiter, getPublicCafe);
 
 export default router;

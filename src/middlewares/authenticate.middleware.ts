@@ -21,7 +21,10 @@ import {
   redisMget,
   redisSet,
 } from "../infrastructure/redis/index.js";
-import logger, { logSecurityAudit } from "../config/logger.config.js";
+import logger, {
+  logSecurityAudit,
+  updateLogContext,
+} from "../config/logger.config.js";
 import { serverConfig } from "../config/index.js";
 
 export const ROLE_RANK: Record<UserRole, number> = {
@@ -327,6 +330,7 @@ export const revokeSession = async (
   const expiresAt = Date.now() + ttlSec * 1000;
 
   if (sessionId) {
+    inMemoryActivityThrottle.delete(sessionId);
     setBoundedMapEntry(inMemoryRevokedSessions, sessionId, { expiresAt });
   }
   if (jti) {
@@ -479,19 +483,30 @@ const updateSessionActivityThrottled = async (
 
   const throttleKey = redisKeys.sessionActivityThrottle(sessionId);
 
+  let acquiredRedisThrottle = false;
+
   try {
     const acquired = await redisSet(throttleKey, "1", {
       ex: throttleSec,
       nx: true,
     });
+    if (acquired !== "OK") {
+      // Another worker recently updated this session; pause briefly locally
+      // rather than suppressing for a full unknown remaining TTL window.
+      const backoffMs = Math.min(
+        5000,
+        Math.max(500, Math.floor((throttleSec * 1000) / 4)),
+      );
+      setBoundedMapEntry(inMemoryActivityThrottle, sessionId, nowMs + backoffMs);
+      return;
+    }
+
+    acquiredRedisThrottle = true;
     setBoundedMapEntry(
       inMemoryActivityThrottle,
       sessionId,
       nowMs + throttleSec * 1000,
     );
-    if (acquired !== "OK") {
-      return;
-    }
 
     const now = new Date(nowMs);
     const nextIdleMs = nowMs + serverConfig.SESSION_IDLE_TIMEOUT_MS;
@@ -597,6 +612,10 @@ const updateSessionActivityThrottled = async (
       );
     }
   } catch (err) {
+    inMemoryActivityThrottle.delete(sessionId);
+    if (acquiredRedisThrottle) {
+      await redisDel(throttleKey).catch(() => {});
+    }
     logger.error("Failed to update throttled session activity", {
       userId,
       sessionId,
@@ -921,6 +940,14 @@ export const verifyAuthenticatedCredential = async (
     }
 
     // 4. CHECK DISTRIBUTED REDIS USER CACHE (BOUNDED 30s TTL + PUB/SUB & REDIS REVOCATION CHECKED ABOVE)
+    if (redisReady && cachedUserJson === "__DELETED__") {
+      return {
+        ok: false,
+        statusCode: 401,
+        message: "Unauthorized. User not found or account deactivated.",
+      };
+    }
+
     if (redisReady && cachedUserJson) {
       try {
         const cachedUser = JSON.parse(cachedUserJson) as IUser;
@@ -1000,6 +1027,28 @@ export const verifyAuthenticatedCredential = async (
 
     if (!user || !user.isActive) {
       await clearUserCache(userId);
+      if (!user) {
+        await revokeSession(
+          userId,
+          sid,
+          jti,
+          "user_not_found",
+          tokenExpUnixSec,
+        );
+        if (redisReady) {
+          await redisSet(redisKeys.userCache(userId), "__DELETED__", {
+            ex: REDIS_TTLS.USER_CACHE_NEGATIVE_SEC,
+          }).catch(() => {});
+        }
+      } else {
+        await revokeSession(
+          userId,
+          sid,
+          jti,
+          "account_deactivated",
+          tokenExpUnixSec,
+        );
+      }
       return {
         ok: false,
         statusCode: 401,
@@ -1073,8 +1122,17 @@ export const authenticate: RequestHandler = async (
   next: NextFunction,
 ): Promise<void> => {
   const authorization = req.headers.authorization;
+  const requestId = (req as Request & { requestId?: string }).requestId;
 
   if (!authorization || !authorization.startsWith("Bearer ")) {
+    logSecurityAudit({
+      eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+      requestId,
+      ip: req.ip,
+      success: false,
+      reasonCode: "MISSING_AUTH_HEADER",
+      metadata: { method: req.method, route: req.originalUrl.split("?")[0] },
+    });
     res.status(401).json({
       success: false,
       message: "Authorization token is required",
@@ -1085,6 +1143,14 @@ export const authenticate: RequestHandler = async (
   const token = authorization.slice(7).trim();
 
   if (!token) {
+    logSecurityAudit({
+      eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+      requestId,
+      ip: req.ip,
+      success: false,
+      reasonCode: "EMPTY_BEARER_TOKEN",
+      metadata: { method: req.method, route: req.originalUrl.split("?")[0] },
+    });
     res.status(401).json({
       success: false,
       message: "Authorization token is required",
@@ -1092,7 +1158,6 @@ export const authenticate: RequestHandler = async (
     return;
   }
 
-  const requestId = (req as Request & { requestId?: string }).requestId;
   const result = await verifyAuthenticatedCredential(token, {
     requestId,
     ip: req.ip,
@@ -1109,6 +1174,7 @@ export const authenticate: RequestHandler = async (
 
   req.user = result.user;
   req.auth = result.auth;
+  updateLogContext({ userId: String(result.user._id) });
   next();
 };
 
@@ -1117,7 +1183,15 @@ export const authenticate: RequestHandler = async (
  */
 export const authorize = (...roles: UserRole[]): RequestHandler => {
   return (req: Request, res: Response, next: NextFunction): void => {
+    const requestId = (req as Request & { requestId?: string }).requestId;
     if (!req.user) {
+      logSecurityAudit({
+        eventType: "UNAUTHORIZED_ACCESS_ATTEMPT",
+        requestId,
+        ip: req.ip,
+        success: false,
+        reasonCode: "UNAUTHENTICATED_AUTHORIZE_CHECK",
+      });
       res.status(401).json({
         success: false,
         message: "Authentication required",
@@ -1126,6 +1200,20 @@ export const authorize = (...roles: UserRole[]): RequestHandler => {
     }
 
     if (!roles.includes(req.user.role)) {
+      logSecurityAudit({
+        eventType: "UNAUTHORIZED_ROLE_ACCESS",
+        userId: String(req.user._id),
+        sessionId: req.auth?.sid,
+        requestId,
+        ip: req.ip,
+        success: false,
+        reasonCode: "INSUFFICIENT_ROLE_PERMISSIONS",
+        metadata: {
+          requiredRoles: roles,
+          actualRole: req.user.role,
+          route: req.originalUrl.split("?")[0],
+        },
+      });
       res.status(403).json({
         success: false,
         message: "Forbidden. Insufficient permissions.",

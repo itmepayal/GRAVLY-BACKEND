@@ -46,11 +46,19 @@ export const resetRedisCircuitBreaker = (): void => {
 
 const onCommandSuccess = (): void => {
   if (circuitState !== "CLOSED" || consecutiveFailures > 0) {
+    const prevState = circuitState;
     circuitState = "CLOSED";
     consecutiveFailures = 0;
     circuitOpenedAt = 0;
     halfOpenInFlight = false;
     recordCircuitState("CLOSED");
+    if (prevState !== "CLOSED") {
+      logger.info("[redis] Circuit breaker CLOSED; Redis recovered", {
+        previousState: prevState,
+        circuitState: "CLOSED",
+        operation: "REDIS_CIRCUIT_CLOSED",
+      });
+    }
   }
 };
 
@@ -86,6 +94,10 @@ const checkCircuitAllowance = (): void => {
     circuitState = "HALF_OPEN";
     halfOpenInFlight = true;
     recordCircuitState("HALF_OPEN");
+    logger.info("[redis] Circuit breaker HALF_OPEN; probing Redis availability", {
+      circuitState: "HALF_OPEN",
+      operation: "REDIS_CIRCUIT_HALF_OPEN",
+    });
   }
 };
 
@@ -143,6 +155,12 @@ const runWithFailover = async <T>(
         result = await runTcp(tcpFn);
       } catch (tcpErr) {
         if (getUpstashRestClient()) {
+          logger.warn("[redis] TCP command failed; failing over to Upstash REST", {
+            mode: "rest",
+            circuitState: getRedisCircuitState(),
+            error: tcpErr instanceof Error ? tcpErr.message : String(tcpErr),
+            operation: "REDIS_REST_FALLBACK",
+          });
           result = await restFn();
         } else {
           throw tcpErr;

@@ -2,6 +2,18 @@ import crypto from "crypto";
 import { serverConfig } from "./index.js";
 import { ExternalServiceError } from "../utils/errors/app.error.js";
 
+export class CashfreeApiError extends ExternalServiceError {
+  httpStatus: number;
+  retryable: boolean;
+
+  constructor(message: string, httpStatus: number, retryable: boolean) {
+    super(message, retryable ? 503 : httpStatus);
+    this.name = "CashfreeApiError";
+    this.httpStatus = httpStatus;
+    this.retryable = retryable;
+  }
+}
+
 export const CASHFREE_BASE_URL =
   serverConfig.CASHFREE_ENV === "PRODUCTION"
     ? "https://api.cashfree.com/pg"
@@ -68,26 +80,31 @@ export const createCashfreeOrder = async (payload: {
     },
 
     order_meta: {
-      return_url: `${serverConfig.CLIENT_URL}/order/status?order_id={order_id}`,
-      notify_url: `${serverConfig.SERVER_URL}/api/v1/payments/webhook`,
+      return_url: `${serverConfig.CLIENT_URL.replace(/\/+$/, "")}/order/status?order_id={order_id}`,
+      notify_url: `${serverConfig.SERVER_URL.replace(/\/+$/, "")}/api/v1/payments/webhook`,
     },
   };
 
-  const { ok, data } = await fetchCashfreeJson(`${CASHFREE_BASE_URL}/orders`, {
+  const { ok, status, data } = await fetchCashfreeJson(`${CASHFREE_BASE_URL}/orders`, {
     method: "POST",
     headers: cashfreeHeaders,
     body: JSON.stringify(requestBody),
   });
 
   if (!ok) {
-    throw new Error(String(data?.message || "Cashfree order creation failed"));
+    const retryable = status === 429 || status >= 500;
+    throw new CashfreeApiError(
+      String(data?.message || "Cashfree order creation failed"),
+      status,
+      retryable,
+    );
   }
 
   return data;
 };
 
 export const verifyCashfreeOrder = async (cfOrderId: string) => {
-  const { ok, data } = await fetchCashfreeJson(
+  const { ok, status, data } = await fetchCashfreeJson(
     `${CASHFREE_BASE_URL}/orders/${encodeURIComponent(cfOrderId)}`,
     {
       method: "GET",
@@ -96,9 +113,11 @@ export const verifyCashfreeOrder = async (cfOrderId: string) => {
   );
 
   if (!ok) {
-    throw new ExternalServiceError(
+    const retryable = status === 429 || status >= 500;
+    throw new CashfreeApiError(
       String(data?.message || "Cashfree order verification failed"),
-      503,
+      status,
+      retryable,
     );
   }
 
@@ -152,7 +171,7 @@ export const createCashfreeRefund = async (payload: {
   refundId: string;
   refundNote?: string;
 }) => {
-  const { ok, data } = await fetchCashfreeJson(
+  const { ok, status, data } = await fetchCashfreeJson(
     `${CASHFREE_BASE_URL}/orders/${encodeURIComponent(payload.orderId)}/refunds`,
     {
       method: "POST",
@@ -161,7 +180,7 @@ export const createCashfreeRefund = async (payload: {
         "x-idempotency-key": payload.refundId,
       },
       body: JSON.stringify({
-        refund_amount: payload.refundAmount,
+        refund_amount: Number(payload.refundAmount.toFixed(2)),
         refund_id: payload.refundId,
         refund_note: payload.refundNote ?? "Order refund",
         refund_speed: "STANDARD",
@@ -170,7 +189,40 @@ export const createCashfreeRefund = async (payload: {
   );
 
   if (!ok) {
-    throw new Error(String(data?.message || "Cashfree refund creation failed"));
+    const retryable = status === 429 || status >= 500;
+    throw new CashfreeApiError(
+      String(data?.message || "Cashfree refund creation failed"),
+      status,
+      retryable,
+    );
+  }
+
+  return data;
+};
+
+export const verifyCashfreeRefund = async (
+  orderId: string,
+  refundId: string,
+) => {
+  const { ok, status, data } = await fetchCashfreeJson(
+    `${CASHFREE_BASE_URL}/orders/${encodeURIComponent(orderId)}/refunds/${encodeURIComponent(refundId)}`,
+    {
+      method: "GET",
+      headers: cashfreeHeaders,
+    },
+  );
+
+  if (status === 404) {
+    return null;
+  }
+
+  if (!ok) {
+    const retryable = status === 429 || status >= 500;
+    throw new CashfreeApiError(
+      String(data?.message || "Cashfree refund status verification failed"),
+      status,
+      retryable,
+    );
   }
 
   return data;

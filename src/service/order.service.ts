@@ -2,6 +2,7 @@ import { randomBytes } from "crypto";
 import { ClientSession, HydratedDocument, Types } from "mongoose";
 
 import { Cart } from "../models/cart.model.js";
+import { Cafe } from "../models/cafe.model.js";
 import { MenuItem, IMenuItem } from "../models/menuItem.model.js";
 import { Order, IOrder, OrderStatus } from "../models/order.model.js";
 import { Payment } from "../models/payment.model.js";
@@ -80,8 +81,7 @@ const VISIBLE_TO_CAFE = {
 
 const PHONE = /^[6-9]\d{9}$/;
 
-/* flat platform fee added to every order (in rupees) */
-const PLATFORM_FEE = 10;
+const roundMoney = (v: number): number => Math.round(v * 100) / 100;
 
 /* =====================================================
    HELPERS
@@ -188,8 +188,13 @@ const STUDENT_POPULATE = {
 
 const findOrderableCafe = async (
   cafeId: Types.ObjectId | string,
+  txSession?: ClientSession,
 ): Promise<OrderableCafeMeta> => {
-  const cafe = await getOrderableCafeMeta(cafeId);
+  const cafe = await Cafe.findById(
+    cafeId,
+    "name isOpen isApproved approvalStatus isVisible isActive deliveryEnabled pickupEnabled deliveryFee platformFee",
+    txSession ? { session: txSession } : undefined,
+  ).lean<OrderableCafeMeta | null>();
 
   if (
     !cafe ||
@@ -289,79 +294,95 @@ export const placeOrderService = async (
 ) => {
   assertObjectId(studentId, "student ID");
 
-  const cart = await Cart.findOne({
-    student: studentOwnerFilter(studentId, legacyUserId),
-    status: "active",
-  });
-  if (!cart || cart.items.length === 0) {
-    throw new BadRequestError("Your cart is empty");
-  }
-
-  const cafe = await findOrderableCafe(cart.cafe as Types.ObjectId);
-
-  if (cart.orderMethod === "delivery") {
-    if (!cafe.deliveryEnabled) {
-      throw new ConflictError("This cafe does not offer delivery");
-    }
-    const a = cart.deliveryAddress;
-    if (!a?.hostel || !a?.roomNumber || !a?.phone) {
-      throw new BadRequestError(
-        "Delivery needs deliveryAddress with hostel, roomNumber and phone",
-      );
-    }
-    if (!PHONE.test(a.phone)) {
-      throw new BadRequestError("Valid 10 digit phone is required");
-    }
-  } else if (!cafe.pickupEnabled) {
-    throw new ConflictError("This cafe does not offer self pickup");
-  }
-
-  const menu = await MenuItem.find({
-    _id: { $in: cart.items.map((i) => i.menuItem as Types.ObjectId) },
-  })
-    .select("name price isAvailable trackStock stock")
-    .lean<MenuLean[]>();
-
-  const byId = new Map<string, MenuLean>(menu.map((m) => [String(m._id), m]));
-  const problems: string[] = [];
-
-  const orderItems = cart.items.flatMap((line) => {
-    const m = byId.get(String(line.menuItem));
-    const name = m?.name ?? line.name ?? "Item";
-
-    if (!m || !m.isAvailable) {
-      problems.push(`${name}: No longer available`);
-      return [];
-    }
-    if (m.trackStock && m.stock < line.quantity) {
-      problems.push(
-        `${name}: ${m.stock === 0 ? "Out of stock" : `Only ${m.stock} left`}`,
-      );
-      return [];
-    }
-    return [
-      {
-        menuItem: m._id,
-        name: m.name,
-        quantity: line.quantity,
-        price: m.price,
-      },
-    ];
-  });
-
-  if (problems.length > 0) {
-    throw new ConflictError(`Cannot place order. ${problems.join(", ")}`);
-  }
-
-  const subtotal = orderItems.reduce((s, i) => s + i.price * i.quantity, 0);
-  const deliveryFee =
-    cart.orderMethod === "delivery" ? (cafe.deliveryFee ?? 0) : 0;
-  const platformFee = PLATFORM_FEE;
-  const totalAmount = subtotal + deliveryFee + platformFee;
-
-  const { order, reservedCount } = await runWithOptionalTransaction(
+  const { order, reservedCount, cafe } = await runWithOptionalTransaction(
     async (txSession) => {
       const sessionOpt = txSession ? { session: txSession } : {};
+
+      const cart = await Cart.findOne(
+        {
+          student: studentOwnerFilter(studentId, legacyUserId),
+          status: "active",
+        },
+        undefined,
+        sessionOpt,
+      );
+      if (!cart || cart.items.length === 0) {
+        throw new BadRequestError("Your cart is empty");
+      }
+
+      const liveCafe = await findOrderableCafe(
+        cart.cafe as Types.ObjectId,
+        txSession,
+      );
+
+      if (cart.orderMethod === "delivery") {
+        if (!liveCafe.deliveryEnabled) {
+          throw new ConflictError("This cafe does not offer delivery");
+        }
+        const a = cart.deliveryAddress;
+        if (!a?.hostel || !a?.roomNumber || !a?.phone) {
+          throw new BadRequestError(
+            "Delivery needs deliveryAddress with hostel, roomNumber and phone",
+          );
+        }
+        if (!PHONE.test(a.phone)) {
+          throw new BadRequestError("Valid 10 digit phone is required");
+        }
+      } else if (!liveCafe.pickupEnabled) {
+        throw new ConflictError("This cafe does not offer self pickup");
+      }
+
+      const menu = await MenuItem.find(
+        { _id: { $in: cart.items.map((i) => i.menuItem as Types.ObjectId) } },
+        "name price isAvailable trackStock stock",
+        sessionOpt,
+      ).lean<MenuLean[]>();
+
+      const byId = new Map<string, MenuLean>(
+        menu.map((m) => [String(m._id), m]),
+      );
+      const problems: string[] = [];
+
+      const orderItems = cart.items.flatMap((line) => {
+        const m = byId.get(String(line.menuItem));
+        const name = m?.name ?? line.name ?? "Item";
+
+        if (!m || !m.isAvailable) {
+          problems.push(`${name}: No longer available`);
+          return [];
+        }
+        if (m.trackStock && m.stock < line.quantity) {
+          problems.push(
+            `${name}: ${m.stock === 0 ? "Out of stock" : `Only ${m.stock} left`}`,
+          );
+          return [];
+        }
+        return [
+          {
+            menuItem: m._id,
+            name: m.name,
+            quantity: line.quantity,
+            price: roundMoney(m.price),
+          },
+        ];
+      });
+
+      if (problems.length > 0) {
+        throw new ConflictError(`Cannot place order. ${problems.join(", ")}`);
+      }
+
+      const subtotal = roundMoney(
+        orderItems.reduce((s, i) => s + i.price * i.quantity, 0),
+      );
+      const deliveryFee =
+        cart.orderMethod === "delivery"
+          ? roundMoney(Math.max(0, Number(liveCafe.deliveryFee ?? 0)))
+          : 0;
+      const platformFee = roundMoney(
+        Math.max(0, Number(liveCafe.platformFee ?? 0)),
+      );
+      const totalAmount = roundMoney(subtotal + deliveryFee + platformFee);
+
       const claimed = await Cart.findOneAndUpdate(
         { _id: cart._id, status: "active" },
         { $set: { status: "ordered" } },
@@ -375,19 +396,31 @@ export const placeOrderService = async (
       );
       try {
         for (const item of sortedReserveItems) {
-          if (!byId.get(String(item.menuItem))?.trackStock) continue;
+          const liveItem = byId.get(String(item.menuItem));
+          if (!liveItem?.trackStock) continue;
 
           const r = await MenuItem.updateOne(
             {
               _id: item.menuItem,
               trackStock: true,
+              isAvailable: true,
+              price: liveItem.price,
               stock: { $gte: item.quantity },
             },
             { $inc: { stock: -item.quantity } },
             sessionOpt,
           );
           if (r.modifiedCount !== 1) {
-            throw new ConflictError(`${item.name}: not enough stock`);
+            logger.warn("[order] Inventory reservation conflict", {
+              studentId,
+              cafeId: String(liveCafe._id),
+              menuItemId: String(item.menuItem),
+              quantity: item.quantity,
+              operation: "ORDER_INVENTORY_CONFLICT",
+            });
+            throw new ConflictError(
+              `${item.name}: item availability or stock changed during checkout`,
+            );
           }
           reserved.push(item);
         }
@@ -395,7 +428,7 @@ export const placeOrderService = async (
         const orderDoc = {
           orderNumber: makeOrderNumber(),
           student: oid(studentId),
-          cafe: new Types.ObjectId(String(cafe._id)),
+          cafe: new Types.ObjectId(String(liveCafe._id)),
           items: orderItems,
           orderMethod: cart.orderMethod,
           deliveryAddress:
@@ -408,13 +441,14 @@ export const placeOrderService = async (
           status: "pending" as const,
           paymentMethod: cart.paymentMethod,
           paymentStatus: "pending" as const,
+          stockReleased: false,
         };
 
         const created = txSession
           ? (await Order.create([orderDoc], { session: txSession }))[0]
           : await Order.create(orderDoc);
 
-        return { order: created, reservedCount: reserved.length };
+        return { order: created, reservedCount: reserved.length, cafe: liveCafe };
       } catch (err) {
         if (!txSession) {
           await safeRelease(reserved);
@@ -439,6 +473,16 @@ export const placeOrderService = async (
   if (reservedCount > 0) {
     await invalidatePublicMenuCaches(String(cafe._id));
   }
+  logger.info("Order created successfully", {
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    cafeId: String(cafe._id),
+    studentId,
+    paymentMethod: order.paymentMethod,
+    totalAmount: order.totalAmount,
+    reservedCount,
+    operation: "CREATE_ORDER",
+  });
   emitOrderLifecycleEvent(order);
   return orderView(order, { _id: cafe._id, name: cafe.name });
 };
@@ -532,11 +576,44 @@ export const cancelMyOrderService = async (
 
   const ownerFilter = studentOwnerFilter(studentId, legacyUserId);
 
-  const order = await Order.findOneAndUpdate(
-    { _id: oid(orderId), student: ownerFilter, status: "pending" },
-    { $set: { status: "cancelled", completedAt: new Date() } },
-    { new: true },
-  ).populate("cafe", "name");
+  const order = await runWithOptionalTransaction(async (txSession) => {
+    const sessionOpt = txSession ? { session: txSession } : {};
+    const doc = await Order.findOneAndUpdate(
+      {
+        _id: oid(orderId),
+        student: ownerFilter,
+        status: "pending",
+        stockReleased: { $ne: true },
+      },
+      {
+        $set: {
+          status: "cancelled",
+          completedAt: new Date(),
+          stockReleased: true,
+        },
+      },
+      { new: true, ...sessionOpt },
+    ).populate("cafe", "name");
+
+    if (!doc) return null;
+
+    try {
+      await releaseStock(doc.items, txSession);
+    } catch (releaseErr) {
+      if (!txSession) {
+        await Order.updateOne(
+          { _id: doc._id, status: "cancelled" },
+          {
+            $set: { status: "pending", stockReleased: false },
+            $unset: { completedAt: "" },
+          },
+        ).catch(() => {});
+      }
+      throw releaseErr;
+    }
+
+    return doc;
+  });
 
   if (!order) {
     return failTransition(
@@ -546,7 +623,6 @@ export const cancelMyOrderService = async (
     );
   }
 
-  await safeRelease(order.items);
   await invalidatePublicMenuCaches(extractObjectIdString(order.cafe));
 
   if (order.paymentMethod === "online" && order.paymentStatus === "pending") {
@@ -562,10 +638,11 @@ export const cancelMyOrderService = async (
     }
 
     const refreshed = await Order.findById(order._id)
-      .select("paymentStatus")
+      .select("paymentStatus paymentId")
       .lean();
     if (refreshed) {
       order.paymentStatus = refreshed.paymentStatus;
+      order.paymentId = refreshed.paymentId;
     }
 
     if (gatewaySynced && order.paymentStatus === "pending") {
@@ -590,6 +667,13 @@ export const cancelMyOrderService = async (
 
   await refundIfPaid(order);
 
+  logger.info("Order cancelled by student", {
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    studentId,
+    cafeId: extractObjectIdString(order.cafe),
+    operation: "CANCEL_ORDER",
+  });
   emitOrderLifecycleEvent(order);
 
   return orderView(order);
@@ -689,6 +773,11 @@ export const acceptOrderService = async (cafeId: string, orderId: string) => {
       "Only pending (and paid, if online) orders can be accepted",
     );
   }
+  logger.info("Order accepted by cafe", {
+    orderId: String(order._id),
+    cafeId,
+    operation: "ACCEPT_ORDER",
+  });
   emitOrderLifecycleEvent(order);
   return orderView(order);
 };
@@ -711,24 +800,48 @@ export const rejectOrderService = async (
   }
   const reason = given || "Rejected by the cafe";
 
-  const order = await Order.findOneAndUpdate(
-    {
-      _id: oid(orderId),
-      cafe: oid(cafeId),
-      status: "pending",
-      ...VISIBLE_TO_CAFE,
-    },
-    {
-      $set: {
-        status: "rejected",
-        rejectionReason: reason,
-        completedAt: new Date(),
+  const order = await runWithOptionalTransaction(async (txSession) => {
+    const sessionOpt = txSession ? { session: txSession } : {};
+    const doc = await Order.findOneAndUpdate(
+      {
+        _id: oid(orderId),
+        cafe: oid(cafeId),
+        status: "pending",
+        stockReleased: { $ne: true },
+        ...VISIBLE_TO_CAFE,
       },
-    },
-    { new: true },
-  )
-    .populate("cafe", "name")
-    .populate(STUDENT_POPULATE);
+      {
+        $set: {
+          status: "rejected",
+          rejectionReason: reason,
+          completedAt: new Date(),
+          stockReleased: true,
+        },
+      },
+      { new: true, ...sessionOpt },
+    )
+      .populate("cafe", "name")
+      .populate(STUDENT_POPULATE);
+
+    if (!doc) return null;
+
+    try {
+      await releaseStock(doc.items, txSession);
+    } catch (releaseErr) {
+      if (!txSession) {
+        await Order.updateOne(
+          { _id: doc._id, status: "rejected" },
+          {
+            $set: { status: "pending", stockReleased: false },
+            $unset: { rejectionReason: "", completedAt: "" },
+          },
+        ).catch(() => {});
+      }
+      throw releaseErr;
+    }
+
+    return doc;
+  });
 
   if (!order) {
     return failTransition(
@@ -738,11 +851,15 @@ export const rejectOrderService = async (
     );
   }
 
-  await safeRelease(order.items);
   await invalidatePublicMenuCaches(extractObjectIdString(order.cafe));
 
   await refundIfPaid(order);
 
+  logger.info("Order rejected by cafe", {
+    orderId: String(order._id),
+    cafeId,
+    operation: "REJECT_ORDER",
+  });
   emitOrderLifecycleEvent(order);
   return orderView(order);
 };
@@ -791,23 +908,38 @@ export const updateOrderStatusService = async (
       let recordedCash: Awaited<ReturnType<typeof recordCashPayment>> | null =
         null;
       if (target === "delivered" && doc.paymentMethod === "cash") {
-        await Order.updateOne(
-          { _id: doc._id, paymentStatus: { $ne: "paid" } },
-          { $set: { paymentStatus: "paid" } },
-          sessionOpt,
-        );
-        doc.paymentStatus = "paid";
-
         try {
           recordedCash = await recordCashPayment(doc._id, {
             txSession,
             deferEmit: true,
           });
-        } catch (e) {
-          logger.error("[order] cash payment record failed", {
+          await Order.updateOne(
+            { _id: doc._id },
+            {
+              $set: {
+                paymentStatus: "paid",
+                paymentId: recordedCash._id,
+              },
+            },
+            sessionOpt,
+          );
+          doc.paymentStatus = "paid";
+          doc.paymentId = recordedCash._id;
+        } catch (cashErr) {
+          if (!txSession) {
+            await Order.updateOne(
+              { _id: doc._id, status: "delivered" },
+              {
+                $set: { status: "ready", paymentStatus: "pending" },
+                $unset: { completedAt: "" },
+              },
+            ).catch(() => {});
+          }
+          logger.error("[order] cash payment persistence failed", {
             orderId: String(doc._id),
-            error: e instanceof Error ? e.message : String(e),
+            error: cashErr instanceof Error ? cashErr.message : String(cashErr),
           });
+          throw cashErr;
         }
       }
 
@@ -827,6 +959,14 @@ export const updateOrderStatusService = async (
     emitPaymentLifecycleEvent(cashPaymentCreated, "paid");
   }
 
+  logger.info("Order status updated", {
+    orderId: String(order._id),
+    cafeId,
+    status: target,
+    paymentStatus: order.paymentStatus,
+    cashPaymentLinked: Boolean(cashPaymentCreated),
+    operation: "UPDATE_ORDER_STATUS",
+  });
   emitOrderLifecycleEvent(order);
   return orderView(order);
 };

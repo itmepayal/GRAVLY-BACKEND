@@ -158,16 +158,34 @@ export const runWithOptionalTransaction = async <T>(
   work: (session?: ClientSession) => Promise<T>,
 ): Promise<T> => {
   if (!supportsMongoTransactions()) {
+    logger.debug("[mongo] Running operation without multi-document transaction", {
+      operation: "MONGO_NO_TX",
+    });
     return work(undefined);
   }
 
+  const startedAt = performance.now();
   const session = await mongoose.startSession();
+  logger.debug("[mongo] Transaction started", { operation: "MONGO_TX_START" });
   try {
     let result!: T;
     await session.withTransaction(async () => {
       result = await work(session);
     });
+    const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+    logger.debug("[mongo] Transaction committed", {
+      operation: "MONGO_TX_COMMIT",
+      durationMs,
+    });
     return result;
+  } catch (err) {
+    const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+    logger.error("[mongo] Transaction aborted or failed", {
+      operation: "MONGO_TX_ABORT",
+      durationMs,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   } finally {
     await session.endSession();
   }

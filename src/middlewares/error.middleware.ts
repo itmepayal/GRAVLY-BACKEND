@@ -77,6 +77,9 @@ const handleError = (
     } else {
       message = err.message || "Validation failed.";
     }
+  } else if (err.name === "VersionError") {
+    statusCode = 409;
+    message = "The resource was modified concurrently. Please retry.";
   } else if (err.name === "CastError") {
     statusCode = 400;
     const path = err.path || "identifier";
@@ -131,14 +134,36 @@ const handleError = (
   }
 
   const requestId = (req as Request & { requestId?: string }).requestId;
+  const route =
+    req?.route?.path !== undefined
+      ? `${req.baseUrl}${String(req.route.path)}`
+      : (req?.originalUrl || req?.url || "/").split("?")[0];
+  const userId = req?.user?._id ? String(req.user._id) : undefined;
+
   if (statusCode >= 500) {
+    (res.locals as { __serverErrorLogged?: boolean }).__serverErrorLogged = true;
     logger.error(err.message || "Internal Server Error", {
       requestId,
       statusCode,
+      errorCode: err.code,
       name: err.name,
       stack: err.stack,
       method: req?.method,
-      url: req?.originalUrl || req?.url,
+      route,
+      ...(userId ? { userId } : {}),
+      operation: "HTTP_ERROR",
+    });
+  } else {
+    logger.debug("Operational request error", {
+      requestId,
+      statusCode,
+      errorCode: err.code,
+      name: err.name,
+      message,
+      method: req?.method,
+      route,
+      ...(userId ? { userId } : {}),
+      operation: "HTTP_OPERATIONAL_ERROR",
     });
   }
 

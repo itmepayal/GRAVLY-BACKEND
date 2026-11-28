@@ -16,11 +16,12 @@ export const swaggerSpec = swaggerJsdoc({
     },
     servers: [
       {
-        url:
-          serverConfig.NODE_ENV == "development"
-            ? "http://localhost:8000/api/v1"
-            : "https://gravly-backend-api.onrender.com/api/v1",
-        description: "API v1",
+        url: "http://localhost:8000/api/v1",
+        description: "Local Development Server",
+      },
+      {
+        url: "https://gravly-backend-api.onrender.com/api/v1",
+        description: "Production Server",
       },
     ],
     tags: [
@@ -50,6 +51,18 @@ export const swaggerSpec = swaggerJsdoc({
         name: "Menu - Public",
         description: "Cafe menu visible to students (no login needed)",
       },
+      {
+        name: "Cart",
+        description: "Student shopping cart management",
+      },
+      {
+        name: "Orders",
+        description: "Student order placement, tracking, and cancellation",
+      },
+      {
+        name: "Cafe Orders",
+        description: "Cafe owner incoming order workflow, summary, and history",
+      },
     ],
     components: {
       securitySchemes: {
@@ -62,6 +75,10 @@ export const swaggerSpec = swaggerJsdoc({
           properties: {
             success: { type: "boolean", example: false },
             message: { type: "string", example: "Something went wrong" },
+            requestId: {
+              type: "string",
+              example: "5b3a4f6b-da81-4e45-bfff-be27cf0fd7c9",
+            },
           },
         },
         Pagination: {
@@ -71,6 +88,15 @@ export const swaggerSpec = swaggerJsdoc({
             page: { type: "integer", example: 1 },
             limit: { type: "integer", example: 10 },
             pages: { type: "integer", example: 5 },
+          },
+        },
+        PagePagination: {
+          type: "object",
+          properties: {
+            total: { type: "integer", example: 42 },
+            page: { type: "integer", example: 1 },
+            limit: { type: "integer", example: 10 },
+            totalPages: { type: "integer", example: 5 },
           },
         },
         FileObject: {
@@ -125,6 +151,55 @@ export const swaggerSpec = swaggerJsdoc({
                 user: { $ref: "#/components/schemas/User" },
               },
             },
+          },
+        },
+        CafeOwnerAuthResponse: {
+          type: "object",
+          properties: {
+            success: { type: "boolean", example: true },
+            message: {
+              type: "string",
+              example: "Cafe Owner Google authentication successful",
+            },
+            data: {
+              type: "object",
+              properties: {
+                accessToken: { type: "string" },
+                refreshToken: { type: "string" },
+                tokenType: { type: "string", example: "Bearer" },
+                isApproved: { type: "boolean", example: false },
+                approvalStatus: {
+                  type: "string",
+                  enum: ["not_registered", "pending", "approved", "rejected"],
+                  example: "not_registered",
+                },
+                user: { $ref: "#/components/schemas/User" },
+              },
+            },
+          },
+        },
+        SessionView: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string", format: "uuid" },
+            deviceName: { type: "string", example: "Chrome on Linux" },
+            deviceType: { type: "string", example: "desktop" },
+            browser: { type: "string", example: "Chrome" },
+            os: { type: "string", example: "Linux" },
+            ipMasked: { type: "string", example: "192.168.1.*" },
+            status: {
+              type: "string",
+              enum: ["ACTIVE", "REVOKED", "EXPIRED"],
+            },
+            loginAt: { type: "string", format: "date-time" },
+            lastActivityAt: { type: "string", format: "date-time" },
+            lastRefreshAt: {
+              type: "string",
+              format: "date-time",
+              nullable: true,
+            },
+            expiresAt: { type: "string", format: "date-time" },
+            isCurrent: { type: "boolean" },
           },
         },
 
@@ -497,6 +572,147 @@ export const swaggerSpec = swaggerJsdoc({
                 },
               },
             },
+          },
+        },
+
+        /* ---------------- ORDER ---------------- */
+        OrderItemView: {
+          type: "object",
+          properties: {
+            menuItem: { type: "string" },
+            name: { type: "string", example: "Cold Coffee" },
+            quantity: { type: "integer", example: 2 },
+            price: { type: "number", example: 120 },
+            lineTotal: { type: "number", example: 240 },
+          },
+        },
+        OrderView: {
+          type: "object",
+          properties: {
+            _id: { type: "string" },
+            orderNumber: { type: "string", example: "M1K2A9F0B1" },
+            status: {
+              type: "string",
+              enum: [
+                "pending",
+                "confirmed",
+                "preparing",
+                "ready",
+                "delivered",
+                "cancelled",
+                "rejected",
+              ],
+            },
+            cafe: {
+              type: "object",
+              properties: {
+                _id: { type: "string" },
+                name: { type: "string", nullable: true },
+              },
+            },
+            student: {
+              type: "object",
+              properties: {
+                _id: { type: "string" },
+                name: { type: "string", nullable: true },
+              },
+            },
+            orderMethod: { type: "string", enum: ["delivery", "self_pickup"] },
+            deliveryAddress: {
+              type: "object",
+              nullable: true,
+              properties: {
+                hostel: { type: "string" },
+                block: { type: "string" },
+                roomNumber: { type: "string" },
+                landmark: { type: "string" },
+                phone: { type: "string" },
+              },
+            },
+            notes: { type: "string", nullable: true },
+            items: {
+              type: "array",
+              items: { $ref: "#/components/schemas/OrderItemView" },
+            },
+            summary: {
+              type: "object",
+              properties: {
+                subtotal: { type: "number" },
+                deliveryFee: { type: "number" },
+                platformFee: { type: "number" },
+                totalAmount: { type: "number" },
+              },
+            },
+            paymentMethod: { type: "string", enum: ["online", "cash"] },
+            paymentStatus: {
+              type: "string",
+              enum: ["pending", "paid", "failed", "refunded"],
+            },
+            rejectionReason: { type: "string", nullable: true },
+            completedAt: {
+              type: "string",
+              format: "date-time",
+              nullable: true,
+            },
+            createdAt: { type: "string", format: "date-time" },
+            updatedAt: { type: "string", format: "date-time" },
+          },
+        },
+        OrderListView: {
+          type: "object",
+          properties: {
+            orders: {
+              type: "array",
+              items: { $ref: "#/components/schemas/OrderView" },
+            },
+            pagination: { $ref: "#/components/schemas/Pagination" },
+          },
+        },
+        CafeOrderSummaryView: {
+          type: "object",
+          properties: {
+            todayEarnings: { type: "number", example: 1450 },
+            todayOrders: { type: "integer", example: 12 },
+            newOrders: { type: "integer", example: 3 },
+            inProgress: { type: "integer", example: 4 },
+          },
+        },
+        CafeTransactionView: {
+          type: "object",
+          properties: {
+            _id: { type: "string" },
+            orderNumber: { type: "string" },
+            earning: { type: "number" },
+            totalAmount: { type: "number" },
+            paymentMethod: { type: "string", enum: ["online", "cash"] },
+            student: {
+              type: "object",
+              properties: {
+                _id: { type: "string" },
+                name: { type: "string", nullable: true },
+              },
+            },
+            itemsText: {
+              type: "string",
+              example: "Cold Coffee (x2), Sandwich (x1)",
+            },
+            completedAt: {
+              type: "string",
+              format: "date-time",
+              nullable: true,
+            },
+            createdAt: { type: "string", format: "date-time" },
+          },
+        },
+        CafeOrderHistoryView: {
+          type: "object",
+          properties: {
+            totalEarnings: { type: "number", example: 25400 },
+            transactions: {
+              type: "array",
+              items: { $ref: "#/components/schemas/CafeTransactionView" },
+            },
+            pagination: { $ref: "#/components/schemas/Pagination" },
           },
         },
       },

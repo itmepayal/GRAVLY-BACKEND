@@ -72,7 +72,7 @@ const cartSchema = new Schema<ICart>(
       default: "active",
     },
   },
-  { timestamps: true },
+  { timestamps: true, optimisticConcurrency: true },
 );
 
 cartSchema.index({ student: 1, status: 1 });

@@ -137,8 +137,8 @@ export const getMyCafe = async (
 };
 
 /* =====================================================
-   ADMIN: SET CAFE OPEN STATUS
-   PATCH /api/v1/cafes/admin/:id/open-status
+   OWNER: SET MY CAFE OPEN STATUS
+   PATCH /api/v1/cafes/owner/open-status
 ===================================================== */
 export const setCafeOpen = async (
   req: Request,
@@ -146,13 +146,11 @@ export const setCafeOpen = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { id } = req.params;
-
-    validateObjectId(id);
+    const ownerId = getUserId(req);
 
     const isOpen = parseBoolean(req.body?.isOpen);
 
-    const cafe = await setCafeOpenService(new Types.ObjectId(id), isOpen);
+    const cafe = await setCafeOpenService(ownerId, isOpen);
 
     res.status(200).json({
       success: true,

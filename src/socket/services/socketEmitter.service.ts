@@ -5,8 +5,10 @@ import { ROOMS } from "../rooms/room.constants.js";
 import type {
   AppSocketServer,
   CafeApprovalEventPayload,
+  CafeMenuEventPayload,
   CafeOpenStatusEventPayload,
   CafeProfileEventPayload,
+  CartEventPayload,
   OrderEventPayload,
   PaymentEventPayload,
 } from "../socket.types.js";
@@ -238,6 +240,63 @@ export const emitCafeProfileEvent = (
   } catch (err) {
     logger.warn("[socket] Failed emitting cafe profile event", {
       cafeId: input.cafeId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+};
+
+export const emitCafeMenuUpdatedEvent = (
+  input: Omit<CafeMenuEventPayload, "eventId" | "emittedAt">,
+): void => {
+  const io = primaryServer();
+  if (!io) return;
+
+  try {
+    const payload: CafeMenuEventPayload = {
+      ...input,
+      eventId: crypto.randomUUID(),
+      emittedAt: new Date().toISOString(),
+    };
+
+    io.to([
+      ROOMS.cafe(payload.cafeId),
+      ROOMS.cafePrivate(payload.cafeId),
+    ]).emit(SOCKET_EVENTS.CAFE_MENU_UPDATED, payload);
+  } catch (err) {
+    logger.warn("[socket] Failed emitting cafe menu update event", {
+      cafeId: input.cafeId,
+      menuItemId: input.menuItemId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+};
+
+export const emitCartEvent = (
+  input: Omit<CartEventPayload, "eventId" | "emittedAt">,
+  legacyUserId?: string,
+): void => {
+  const io = primaryServer();
+  if (!io) return;
+
+  try {
+    const payload: CartEventPayload = {
+      ...input,
+      eventId: crypto.randomUUID(),
+      emittedAt: new Date().toISOString(),
+    };
+
+    const targets = [
+      ROOMS.student(payload.studentId),
+      ...(legacyUserId ? [ROOMS.user(legacyUserId)] : []),
+    ];
+
+    io.to(targets).emit(SOCKET_EVENTS.CART_UPDATED, payload);
+    if (payload.action === "cleared") {
+      io.to(targets).emit(SOCKET_EVENTS.CART_CLEARED, payload);
+    }
+  } catch (err) {
+    logger.warn("[socket] Failed emitting cart event", {
+      studentId: input.studentId,
       error: err instanceof Error ? err.message : String(err),
     });
   }

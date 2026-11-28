@@ -63,6 +63,9 @@ export const redisKeys = {
   presenceUser: (userId: string): string =>
     `${REDIS_NAMESPACE}:presence:user:${sanitizeSegment(userId, "userId")}`,
 
+  presenceSockets: (userId: string): string =>
+    `${REDIS_NAMESPACE}:presence:sockets:${sanitizeSegment(userId, "userId")}`,
+
   socketUserConns: (userId: string): string =>
     `${REDIS_NAMESPACE}:socket:user_conns:${sanitizeSegment(userId, "userId")}`,
 
@@ -90,11 +93,17 @@ export const redisKeys = {
   paymentInitiateLock: (orderId: string): string =>
     `${REDIS_NAMESPACE}:lock:payment:initiate:${sanitizeSegment(orderId, "orderId")}`,
 
+  paymentRefundLock: (paymentId: string): string =>
+    `${REDIS_NAMESPACE}:lock:payment:refund:${sanitizeSegment(paymentId, "paymentId")}`,
+
   webhookSyncLock: (paymentId: string): string =>
     `${REDIS_NAMESPACE}:lock:payment:webhook:${sanitizeSegment(paymentId, "paymentId")}`,
 
   expireUnpaidOrdersLock: (): string =>
     `${REDIS_NAMESPACE}:job:expire_unpaid_orders:lock`,
+
+  refundRetryJobLock: (): string =>
+    `${REDIS_NAMESPACE}:job:refund_retry:lock`,
 
   jobDeadLetter: (jobName: string): string =>
     `${REDIS_NAMESPACE}:job:dlq:${sanitizeSegment(jobName, "jobName")}`,

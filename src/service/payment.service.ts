@@ -7,22 +7,25 @@ import { Student } from "../models/student.model.js";
 import { User } from "../models/user.model.js";
 import { serverConfig } from "../config/index.js";
 import {
+  CashfreeApiError,
   createCashfreeOrder,
   verifyCashfreeOrder,
   verifyCashfreeWebhookSignature,
   createCashfreeRefund,
+  verifyCashfreeRefund,
 } from "../config/cashfree.config.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
 } from "../utils/errors/app.error.js";
-import logger from "../config/logger.config.js";
+import logger, { logSecurityAudit } from "../config/logger.config.js";
 import { emitOrderCreatedToCafe, emitPaymentEvent } from "../socket/index.js";
 import {
   acquireDistributedLock,
   isRedisAvailable,
   redisKeys,
+  redisSet,
   releaseDistributedLock,
   type DistributedLockHandle,
 } from "../infrastructure/redis/index.js";
@@ -109,61 +112,305 @@ const paymentView = (p: PaymentViewInput) => ({
 });
 
 /* =====================================================
-   REFUND
+   REFUND + RETRY RECONCILIATION
 ===================================================== */
+const MAX_REFUND_RETRIES = 5;
+const BASE_REFUND_RETRY_DELAY_MS = 60 * 1000;
+
+const recordRefundDeadLetter = async (
+  paymentId: string,
+  orderId: string,
+  errorMessage: string,
+  attempts: number,
+): Promise<void> => {
+  if (!isRedisAvailable()) return;
+  try {
+    await redisSet(
+      `${redisKeys.jobDeadLetter("refund")}:${paymentId}`,
+      JSON.stringify({
+        paymentId,
+        orderId,
+        attempts,
+        error: errorMessage,
+        failedAt: new Date().toISOString(),
+      }),
+      { ex: 14 * 24 * 3600 },
+    );
+  } catch {
+    // Best-effort DLQ persistence
+  }
+};
+
 export const refundPayment = async (
   payment: PaymentDoc,
   { updateOrder = true }: { updateOrder?: boolean } = {},
 ): Promise<boolean> => {
+  if (payment.status === "refunded") {
+    return true;
+  }
   if (payment.status !== "success" || payment.method !== "cashfree") {
     return false;
   }
 
-  try {
-    await createCashfreeRefund({
-      orderId: payment.paymentId,
-      refundAmount: payment.amount,
-      refundId: `rf_${payment.paymentId}`,
-      refundNote: "Order cancelled",
-    });
-  } catch (err) {
-    logger.error("[payment] refund failed", {
+  const stableRefundId = payment.refundId || `rf_${payment.paymentId}`;
+  const lock = await acquireDistributedLock(
+    redisKeys.paymentRefundLock(payment.paymentId),
+    30,
+  );
+  if (!lock && isRedisAvailable()) {
+    logger.info("[payment] refund already locked by another worker", {
       paymentId: payment.paymentId,
-      error: err instanceof Error ? err.message : String(err),
     });
     return false;
   }
 
   try {
-    await Payment.updateOne(
-      { _id: payment._id, status: "success" },
-      { $set: { status: "refunded" } },
-    );
-    if (updateOrder) {
-      await Order.updateOne(
-        { _id: payment.order as Types.ObjectId, paymentStatus: "paid" },
-        { $set: { paymentStatus: "refunded" } },
+    const fresh = await Payment.findById(payment._id);
+    if (!fresh) return false;
+    if (fresh.status === "refunded") return true;
+    if (fresh.status !== "success") return false;
+
+    const refundId = fresh.refundId || stableRefundId;
+    const isRetryAttempt =
+      (fresh.refundRetryCount ?? 0) > 0 || fresh.refundStatus === "pending";
+
+    let refundConfirmed = false;
+    let gatewayPayload: unknown = null;
+
+    try {
+      logger.info("[payment] Refund initiated", {
+        paymentId: fresh.paymentId,
+        refundId,
+        orderId: String(fresh.order),
+        amount: fresh.amount,
+        isRetry: isRetryAttempt,
+        operation: "REFUND_INITIATE",
+      });
+      if (isRetryAttempt) {
+        const existingRefund = await verifyCashfreeRefund(
+          fresh.paymentId,
+          refundId,
+        );
+        const existingStatus = String(
+          existingRefund?.refund_status ?? "",
+        ).toUpperCase();
+        if (
+          existingStatus === "SUCCESS" ||
+          existingStatus === "PENDING" ||
+          existingStatus === "ONHOLD"
+        ) {
+          refundConfirmed = true;
+          gatewayPayload = existingRefund;
+        }
+      }
+
+      if (!refundConfirmed) {
+        const res = await createCashfreeRefund({
+          orderId: fresh.paymentId,
+          refundAmount: fresh.amount,
+          refundId,
+          refundNote: "Order cancelled",
+        });
+        const cfRefundStatus = String(res?.refund_status ?? "").toUpperCase();
+        if (cfRefundStatus === "CANCELLED" || cfRefundStatus === "FAILED") {
+          throw new CashfreeApiError(
+            `Cashfree rejected refund with status ${cfRefundStatus}`,
+            422,
+            false,
+          );
+        }
+        refundConfirmed = true;
+        gatewayPayload = res;
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const retryable =
+        err instanceof CashfreeApiError
+          ? err.retryable || err.httpStatus === 409
+          : true;
+      const prevRetries = fresh.refundRetryCount ?? 0;
+      const nextRetries = prevRetries + 1;
+      const exhausted = !retryable || nextRetries >= MAX_REFUND_RETRIES;
+      const backoffMs = Math.min(
+        30 * 60 * 1000,
+        BASE_REFUND_RETRY_DELAY_MS * 2 ** prevRetries,
       );
+
+      await Payment.updateOne(
+        { _id: fresh._id, status: "success" },
+        {
+          $set: {
+            refundStatus: exhausted ? "failed" : "pending",
+            refundId,
+            refundRetryCount: nextRetries,
+            refundLastError: errMsg.slice(0, 500),
+            refundRequestedAt: fresh.refundRequestedAt ?? new Date(),
+            ...(exhausted
+              ? {}
+              : { refundNextRetryAt: new Date(Date.now() + backoffMs) }),
+          },
+          ...(exhausted ? { $unset: { refundNextRetryAt: "" } } : {}),
+        },
+      );
+
+      if (exhausted) {
+        await recordRefundDeadLetter(
+          fresh.paymentId,
+          String(fresh.order),
+          errMsg,
+          nextRetries,
+        );
+      }
+
+      logger.error("[payment] refund failed", {
+        paymentId: fresh.paymentId,
+        orderId: String(fresh.order),
+        retryable,
+        exhausted,
+        attempt: nextRetries,
+        error: errMsg,
+      });
+      return false;
     }
-    emitPaymentLifecycleEvent(
-      {
-        paymentId: payment.paymentId,
-        order: payment.order,
-        cafe: payment.cafe,
-        student: payment.student,
-        status: "refunded",
-        method: payment.method,
-        amount: payment.amount,
-      },
-      updateOrder ? "refunded" : "paid",
-    );
-  } catch (err) {
-    logger.error("[payment] refunded at gateway but DB update failed", {
-      paymentId: payment.paymentId,
-      error: err instanceof Error ? err.message : String(err),
-    });
+
+    try {
+      await Payment.updateOne(
+        { _id: fresh._id, status: "success" },
+        {
+          $set: {
+            status: "refunded",
+            refundStatus: "refunded",
+            refundId,
+            refundedAt: new Date(),
+            ...(gatewayPayload ? { gatewayResponse: gatewayPayload } : {}),
+          },
+          $unset: { refundNextRetryAt: "", refundLastError: "" },
+        },
+      );
+      if (updateOrder) {
+        await Order.updateOne(
+          { _id: fresh.order as Types.ObjectId, paymentStatus: "paid" },
+          { $set: { paymentStatus: "refunded" } },
+        );
+      }
+      emitPaymentLifecycleEvent(
+        {
+          paymentId: fresh.paymentId,
+          order: fresh.order,
+          cafe: fresh.cafe,
+          student: fresh.student,
+          status: "refunded",
+          method: fresh.method,
+          amount: fresh.amount,
+        },
+        updateOrder ? "refunded" : "paid",
+      );
+      logger.info("[payment] Refund succeeded", {
+        paymentId: fresh.paymentId,
+        refundId,
+        orderId: String(fresh.order),
+        amount: fresh.amount,
+        operation: "REFUND_SUCCESS",
+      });
+    } catch (err) {
+      logger.error("[payment] refunded at gateway but DB update failed", {
+        paymentId: fresh.paymentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return true;
+  } finally {
+    await releaseDistributedLock(lock);
   }
-  return true;
+};
+
+export interface ReconcileRefundsResult {
+  scanned: number;
+  refunded: number;
+  failed: number;
+  permanentFailures: number;
+}
+
+export const reconcilePendingRefunds = async (
+  options: {
+    batchSize?: number;
+    maxPerRun?: number;
+    shouldAbort?: () => boolean;
+  } = {},
+): Promise<ReconcileRefundsResult> => {
+  const batchSize = Math.min(50, Math.max(1, options.batchSize ?? 25));
+  const maxPerRun = Math.max(batchSize, options.maxPerRun ?? 200);
+  const shouldAbort = options.shouldAbort ?? (() => false);
+
+  let scanned = 0;
+  let refunded = 0;
+  let failed = 0;
+  let permanentFailures = 0;
+  const seenPaymentIds = new Set<string>();
+
+  // 1. Reconcile cancelled/rejected online orders whose payment status is still pending (e.g., gateway down at cancel time)
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const pendingCancelledOrders = await Order.find({
+    paymentMethod: "online",
+    paymentStatus: "pending",
+    status: { $in: ["cancelled", "rejected"] },
+    updatedAt: { $gte: dayAgo },
+  })
+    .select("_id")
+    .sort({ updatedAt: 1 })
+    .limit(50)
+    .lean();
+
+  for (const ord of pendingCancelledOrders) {
+    if (shouldAbort()) break;
+    try {
+      await syncLatestPayment(ord._id);
+    } catch (err) {
+      logger.warn("[payment] reconcile cancelled order payment sync failed", {
+        orderId: String(ord._id),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // 2. Retry payments marked refundStatus: "pending" with bounded batches
+  while (scanned < maxPerRun && !shouldAbort()) {
+    const now = new Date();
+    const exclude = Array.from(seenPaymentIds).map((id) => new Types.ObjectId(id));
+    const batch = await Payment.find({
+      ...(exclude.length > 0 ? { _id: { $nin: exclude } } : {}),
+      method: "cashfree",
+      status: "success",
+      refundStatus: "pending",
+      $or: [
+        { refundNextRetryAt: { $lte: now } },
+        { refundNextRetryAt: { $exists: false } },
+      ],
+    })
+      .sort({ refundNextRetryAt: 1, _id: 1 })
+      .limit(Math.min(batchSize, maxPerRun - scanned));
+
+    if (batch.length === 0) break;
+
+    for (const p of batch) {
+      if (shouldAbort()) break;
+      seenPaymentIds.add(String(p._id));
+      scanned += 1;
+
+      const ok = await refundPayment(p);
+      if (ok) {
+        refunded += 1;
+      } else {
+        failed += 1;
+        const after = await Payment.findById(p._id).select("refundStatus").lean();
+        if (after?.refundStatus === "failed") {
+          permanentFailures += 1;
+        }
+      }
+    }
+  }
+
+  return { scanned, refunded, failed, permanentFailures };
 };
 
 export const refundOrderPayment = async (
@@ -220,11 +467,25 @@ const markPaid = async (
     const holder = current?.paymentId ? String(current.paymentId) : null;
 
     if (holder && holder !== String(paid._id)) {
+      logger.warn("[payment] Duplicate payment detected; triggering automatic refund", {
+        paymentId: paid.paymentId,
+        orderId: String(orderId),
+        winningPaymentId: holder,
+        operation: "DUPLICATE_PAYMENT_REFUND",
+      });
       await refundPayment(paid, { updateOrder: false });
       return (await Payment.findById(paid._id)) ?? paid;
     }
     return paid;
   }
+
+  logger.info("[payment] Payment marked paid", {
+    paymentId: paid.paymentId,
+    orderId: String(orderId),
+    amount: paid.amount,
+    method: paid.method,
+    operation: "PAYMENT_SUCCESS",
+  });
 
   const fresh = await Order.findById(orderId);
   if (fresh && (fresh.status === "cancelled" || fresh.status === "rejected")) {
@@ -499,6 +760,12 @@ export const initiatePaymentService = async (
       await payment.save();
 
       if (!cf.payment_session_id) throw new Error("No payment session id");
+      logger.info("[payment] Cashfree payment order created", {
+        paymentId: payment.paymentId,
+        orderId: String(order._id),
+        amount: order.totalAmount,
+        operation: "PAYMENT_INITIATE",
+      });
       emitPaymentLifecycleEvent(payment, order.paymentStatus);
       return view(payment, cf.payment_session_id as string);
     } catch (err) {
@@ -585,6 +852,16 @@ export const handleCashfreeWebhookService = async (
     !signature ||
     !verifyCashfreeWebhookSignature(rawBody, timestamp, signature)
   ) {
+    logger.warn("[payment] Cashfree webhook signature verification failed", {
+      hasTimestamp: Boolean(timestamp),
+      hasSignature: Boolean(signature),
+      operation: "PAYMENT_WEBHOOK_INVALID_SIGNATURE",
+    });
+    logSecurityAudit({
+      eventType: "SUSPICIOUS_AUTHENTICATION",
+      success: false,
+      reasonCode: "CASHFREE_WEBHOOK_INVALID_SIGNATURE",
+    });
     throw new BadRequestError("Invalid webhook signature");
   }
 
@@ -603,13 +880,32 @@ export const handleCashfreeWebhookService = async (
   const cfOrderId = payload.data?.order?.order_id;
   if (typeof cfOrderId !== "string") return;
 
+  logger.info("[payment] Cashfree webhook received", {
+    paymentId: cfOrderId,
+    operation: "PAYMENT_WEBHOOK_RECEIVED",
+  });
+
   const lock = await acquireDistributedLock(
     redisKeys.webhookSyncLock(cfOrderId),
     10,
   );
   try {
     const payment = await Payment.findOne({ paymentId: cfOrderId });
-    if (!payment) return;
+    if (!payment) {
+      logger.warn("[payment] Webhook payment record not found", {
+        paymentId: cfOrderId,
+        operation: "PAYMENT_WEBHOOK_NOT_FOUND",
+      });
+      return;
+    }
+
+    if (payment.status === "success" || payment.status === "refunded") {
+      logger.debug("[payment] Duplicate webhook for already-settled payment", {
+        paymentId: cfOrderId,
+        status: payment.status,
+        operation: "PAYMENT_WEBHOOK_DUPLICATE",
+      });
+    }
 
     const cfPaymentId = payload.data?.payment?.cf_payment_id;
     await syncPayment(
@@ -657,6 +953,13 @@ export const recordCashPayment = async (
     const created = txSession
       ? (await Payment.create([doc], { session: txSession }))[0]
       : await Payment.create(doc);
+
+    logger.info("[payment] Cash payment persisted", {
+      paymentId: created.paymentId,
+      orderId: String(order._id),
+      amount: created.amount,
+      operation: "CASH_PAYMENT_RECORDED",
+    });
 
     if (!deferEmit) {
       emitPaymentLifecycleEvent(created, "paid");

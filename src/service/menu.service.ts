@@ -4,14 +4,17 @@ import { Cafe } from "../models/cafe.model.js";
 import { MenuItem } from "../models/menuItem.model.js";
 import {
   uploadImage,
+  deleteFromCloudinary,
   type CloudinaryFile,
 } from "../config/cloudinary.config.js";
+import { logger } from "../config/logger.config.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
 } from "../utils/errors/app.error.js";
 import { invalidatePublicMenuCaches } from "./cafe.service.js";
+import { emitCafeMenuUpdatedEvent } from "../socket/index.js";
 
 /* =====================================================
    HELPERS
@@ -154,8 +157,34 @@ export const createMenuItemService = async (
     });
 
     await invalidatePublicMenuCaches(String(cafeId));
+    emitCafeMenuUpdatedEvent({
+      cafeId: String(cafeId),
+      menuItemId: String(item._id),
+      action: "created",
+      isAvailable: item.isAvailable,
+      stock: item.stock,
+    });
+    logger.info("Menu item created", {
+      cafeId: String(cafeId),
+      itemId: String(item._id),
+      price: item.price,
+      operation: "MENU_CREATE",
+    });
     return withStatus(item.toObject());
   } catch (error) {
+    if (image?.publicId) {
+      await deleteFromCloudinary(image.publicId, "image", false).catch(
+        (cleanupErr: unknown) => {
+          logger.warn("Best-effort menu image rollback cleanup failed", {
+            publicId: image.publicId,
+            error:
+              cleanupErr instanceof Error
+                ? cleanupErr.message
+                : String(cleanupErr),
+          });
+        },
+      );
+    }
     return duplicateGuard(error);
   }
 };
@@ -249,8 +278,20 @@ export const updateMenuItemService = async (
     update.trackStock = toBool(b.trackStock, "trackStock");
   }
 
+  let uploadedImagePublicId: string | undefined;
+  let existingOldImagePublicId: string | undefined;
+
   if (file) {
+    const existingItem = await MenuItem.findOne({ _id: itemId, cafe: cafeId })
+      .select("image.publicId")
+      .lean();
+    if (!existingItem) {
+      throw new NotFoundError("Menu item not found");
+    }
+    existingOldImagePublicId = existingItem.image?.publicId;
+
     const img = await uploadImage(file, `cafes/${ownerId}/menu`, false);
+    uploadedImagePublicId = img.publicId;
     update.image = { url: img.url, publicId: img.publicId };
   }
 
@@ -266,9 +307,56 @@ export const updateMenuItemService = async (
     ).lean();
 
     if (!item) throw new NotFoundError("Menu item not found");
+
+    if (
+      uploadedImagePublicId &&
+      existingOldImagePublicId &&
+      existingOldImagePublicId !== uploadedImagePublicId
+    ) {
+      await deleteFromCloudinary(
+        existingOldImagePublicId,
+        "image",
+        false,
+      ).catch((cleanupErr: unknown) => {
+        logger.warn("Best-effort old menu image cleanup failed", {
+          publicId: existingOldImagePublicId,
+          error:
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : String(cleanupErr),
+        });
+      });
+    }
+
     await invalidatePublicMenuCaches(String(cafeId));
+    emitCafeMenuUpdatedEvent({
+      cafeId: String(cafeId),
+      menuItemId: String(item._id),
+      action: "updated",
+      isAvailable: item.isAvailable,
+      stock: item.stock,
+    });
+    logger.info("Menu item updated", {
+      cafeId: String(cafeId),
+      itemId: String(item._id),
+      updatedFields: Object.keys(update),
+      operation: "MENU_UPDATE",
+    });
     return withStatus(item);
   } catch (error) {
+    if (uploadedImagePublicId) {
+      await deleteFromCloudinary(uploadedImagePublicId, "image", false).catch(
+        (cleanupErr: unknown) => {
+          logger.warn("Best-effort new menu image rollback cleanup failed", {
+            publicId: uploadedImagePublicId,
+            error:
+              cleanupErr instanceof Error
+                ? cleanupErr.message
+                : String(cleanupErr),
+          });
+        },
+      );
+    }
     if (error instanceof NotFoundError) throw error;
     return duplicateGuard(error);
   }
@@ -293,6 +381,19 @@ export const setMenuAvailabilityService = async (
 
   if (!item) throw new NotFoundError("Menu item not found");
   await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "availability_toggled",
+    isAvailable: item.isAvailable,
+    stock: item.stock,
+  });
+  logger.info("Menu item availability updated", {
+    cafeId: String(cafeId),
+    itemId,
+    isAvailable,
+    operation: "MENU_AVAILABILITY",
+  });
   return withStatus(item);
 };
 
@@ -355,6 +456,20 @@ export const updateMenuStockService = async (
   }
 
   await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "stock_updated",
+    isAvailable: item.isAvailable,
+    stock: item.stock,
+  });
+  logger.info("Menu item stock updated", {
+    cafeId: String(cafeId),
+    itemId,
+    stock: item.stock,
+    trackStock: item.trackStock,
+    operation: "MENU_STOCK_UPDATE",
+  });
   return withStatus(item);
 };
 
@@ -371,7 +486,31 @@ export const deleteMenuItemService = async (
   const item = await MenuItem.findOneAndDelete({ _id: itemId, cafe: cafeId });
   if (!item) throw new NotFoundError("Menu item not found");
 
+  if (item.image?.publicId) {
+    await deleteFromCloudinary(item.image.publicId, "image", false).catch(
+      (cleanupErr: unknown) => {
+        logger.warn("Best-effort deleted menu image cleanup failed", {
+          publicId: item.image?.publicId,
+          error:
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : String(cleanupErr),
+        });
+      },
+    );
+  }
+
   await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "deleted",
+  });
+  logger.info("Menu item deleted", {
+    cafeId: String(cafeId),
+    itemId,
+    operation: "MENU_DELETE",
+  });
   return { _id: item._id, name: item.name };
 };
 
@@ -422,5 +561,19 @@ export const setMenuStockStatusService = async (
   if (!item) throw new NotFoundError("Menu item not found");
 
   await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "stock_updated",
+    isAvailable: item.isAvailable,
+    stock: item.stock,
+  });
+  logger.info("Menu item stock updated", {
+    cafeId: String(cafeId),
+    itemId,
+    stock: item.stock,
+    trackStock: item.trackStock,
+    operation: "MENU_STOCK_UPDATE",
+  });
   return withStatus(item);
 };

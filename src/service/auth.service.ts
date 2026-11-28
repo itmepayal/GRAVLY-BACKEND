@@ -76,7 +76,7 @@ export interface AuthResult {
   token: string;
   refreshToken: string;
   isApproved?: boolean;
-  approvalStatus?: CafeApprovalStatus;
+  approvalStatus?: CafeApprovalStatus | "not_registered";
 }
 
 import {
@@ -314,6 +314,11 @@ export const adminRegisterService = async (
     throw new BadRequestError("Invalid email");
   }
 
+  logger.info("Admin registration started", {
+    emailHash: hashForAudit(normalizedEmail),
+    operation: "ADMIN_REGISTER",
+  });
+
   const existingAdmin = await User.exists({ role: "admin" });
   if (existingAdmin) {
     logSecurityAudit({
@@ -369,6 +374,10 @@ export const adminRegisterService = async (
     success: true,
     reasonCode: "BOOTSTRAP_ADMIN_CREATED",
     metadata: { emailHash: hashForAudit(normalizedEmail) },
+  });
+  logger.info("Admin registration completed", {
+    userId: user._id.toString(),
+    operation: "ADMIN_REGISTER",
   });
 
   return buildAuthResult(user, metadata);
@@ -738,6 +747,24 @@ export const refreshTokenService = async (
       );
 
       if (!updated) {
+        const latest = await RefreshToken.findById(stored._id, undefined, sessionOpt)
+          .select("status revokedReason")
+          .lean();
+
+        const isBenignLogoutRace =
+          latest?.status === "revoked" &&
+          latest.revokedReason !== "refresh_token_reuse_detected" &&
+          latest.revokedReason !== "unknown_family_token_replay" &&
+          latest.revokedReason !== "concurrent_refresh_conflict";
+
+        if (isBenignLogoutRace) {
+          return {
+            conflict: true as const,
+            genuineReuse: false as const,
+            revokedReason: latest.revokedReason || "logout",
+          };
+        }
+
         await revokeTokenFamily(
           familyId,
           user._id.toString(),
@@ -759,7 +786,11 @@ export const refreshTokenService = async (
           user._id.toString(),
           txSession,
         );
-        return { conflict: true as const, nextVersion };
+        return {
+          conflict: true as const,
+          genuineReuse: true as const,
+          nextVersion,
+        };
       }
 
       const successorDoc = {
@@ -818,6 +849,29 @@ export const refreshTokenService = async (
   );
 
   if (rotationOutcome.conflict) {
+    if (!rotationOutcome.genuineReuse) {
+      await revokeSession(
+        user._id.toString(),
+        sessionId,
+        undefined,
+        rotationOutcome.revokedReason,
+      );
+      logSecurityAudit({
+        eventType: "SESSION_INVALID_ACCESS_ATTEMPT",
+        userId: user._id.toString(),
+        sessionId,
+        success: false,
+        reasonCode: "REVOKED_SESSION_REFRESH_RACE",
+        metadata: {
+          familyId,
+          revokedReason: rotationOutcome.revokedReason,
+        },
+      });
+      throw new UnauthorizedError(
+        "Session has been revoked or logged out. Please log in again.",
+      );
+    }
+
     await revokeSession(
       user._id.toString(),
       sessionId,
@@ -845,6 +899,20 @@ export const refreshTokenService = async (
   }
 
   await cacheDeleteKeys(redisKeys.sessionMeta(sessionId));
+
+  logger.info("Refresh token rotated", {
+    userId: user._id.toString(),
+    sessionId,
+    familyId,
+    operation: "REFRESH_ROTATE",
+  });
+  logSecurityAudit({
+    eventType: "REFRESH_SUCCESS",
+    userId: user._id.toString(),
+    sessionId,
+    success: true,
+    reasonCode: "REFRESH_ROTATED",
+  });
 
   return {
     user: user as IUser,
@@ -998,11 +1066,16 @@ export const logoutService = async (
     authContext?.exp,
   );
   logSecurityAudit({
-    eventType: "DEVICE_LOGOUT",
+    eventType: "LOGOUT",
     userId: uid,
     sessionId: targetSid,
     success: true,
     reasonCode: "USER_LOGOUT",
+  });
+  logger.info("User session logged out", {
+    userId: uid,
+    sessionId: targetSid,
+    operation: "LOGOUT",
   });
 };
 
@@ -1069,6 +1142,11 @@ export const logoutAllService = async (
     success: true,
     reasonCode: "USER_LOGOUT_ALL",
     metadata: { revokedSessions },
+  });
+  logger.info("All user sessions revoked", {
+    userId: uid,
+    revokedSessions,
+    operation: "LOGOUT_ALL",
   });
 
   return { revokedSessions };
@@ -1549,6 +1627,20 @@ const socialLogin = async (
 
   const authResult = await buildAuthResult(user as IUser, metadata);
 
+  logSecurityAudit({
+    eventType: "LOGIN_SUCCESS",
+    userId: user._id.toString(),
+    success: true,
+    reasonCode: `SOCIAL_${profile.provider.toUpperCase()}_LOGIN`,
+    metadata: { role: expectedRole },
+  });
+  logger.info("Social login completed", {
+    userId: user._id.toString(),
+    role: expectedRole,
+    provider: profile.provider,
+    operation: "SOCIAL_LOGIN",
+  });
+
   if (expectedRole === "cafeOwner") {
     const cafe = await Cafe.findOne({
       owner: user._id,
@@ -1557,7 +1649,7 @@ const socialLogin = async (
     return {
       ...authResult,
       isApproved: cafe?.isApproved ?? false,
-      approvalStatus: cafe?.approvalStatus ?? "pending",
+      approvalStatus: cafe ? cafe.approvalStatus : "not_registered",
     };
   }
 

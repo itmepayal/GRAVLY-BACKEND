@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { Request, Response, NextFunction, RequestHandler } from "express";
-import logger from "../config/logger.config.js";
+import { serverConfig } from "../config/index.js";
+import logger, { logSecurityAudit } from "../config/logger.config.js";
 import {
   isRedisAvailable,
   redisEval,
@@ -178,6 +179,29 @@ export const createRateLimiter = (
         res.setHeader("RateLimit-Reset", resetSeconds);
 
         if (!allowed) {
+          logger.warn("[rate-limit] Rate limit exceeded", {
+            keyPrefix,
+            ip: getTrustedClientIp(req),
+            userId: req.user?._id ? String(req.user._id) : undefined,
+            route: req.originalUrl.split("?")[0],
+            retryAfterSeconds: resetSeconds,
+            backend: "redis",
+          });
+          if (failClosed) {
+            logSecurityAudit({
+              eventType: "RATE_LIMIT_TRIGGERED",
+              userId: req.user?._id ? String(req.user._id) : undefined,
+              requestId: (req as Request & { requestId?: string }).requestId,
+              ip: getTrustedClientIp(req),
+              success: false,
+              reasonCode: "RATE_LIMIT_EXCEEDED",
+              metadata: {
+                keyPrefix,
+                route: req.originalUrl.split("?")[0],
+                retryAfterSeconds: resetSeconds,
+              },
+            });
+          }
           res.setHeader("Retry-After", resetSeconds);
           res.status(statusCode).json({
             success: false,
@@ -263,6 +287,14 @@ export const createRateLimiter = (
     res.setHeader("RateLimit-Reset", resetSeconds);
 
     if (record.count > maxRequests) {
+      logger.warn("[rate-limit] Rate limit exceeded", {
+        keyPrefix,
+        ip: getTrustedClientIp(req),
+        userId: req.user?._id ? String(req.user._id) : undefined,
+        route: req.originalUrl.split("?")[0],
+        retryAfterSeconds: resetSeconds,
+        backend: "memory",
+      });
       res.setHeader("Retry-After", resetSeconds);
       res.status(statusCode).json({
         success: false,
@@ -412,13 +444,122 @@ export const authGeneralLimiter = createRateLimiter({
   message: "Too many authentication requests. Please try again in a minute.",
 });
 
+const userScopedKeyGenerator = (req: Request): string =>
+  req.user?._id
+    ? `u:${String(req.user._id)}`
+    : `ip:${getTrustedClientIp(req)}`;
+
+const protectedFailClosed = (): boolean =>
+  serverConfig.REDIS_REVOCATION_FAIL_CLOSED;
+
 export const paymentInitiateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
   maxRequests: 20,
   keyPrefix: "cafemart:ratelimit:payment_initiate",
   message: "Too many payment initiation attempts. Please wait a moment.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const paymentStatusLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 30,
+  keyPrefix: "cafemart:ratelimit:payment_status",
+  message: "Too many payment status checks. Please wait a moment.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const paymentWebhookLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 300,
+  keyPrefix: "cafemart:ratelimit:payment_webhook",
+  message: "Too many webhook requests.",
+  failClosed: false,
+});
+
+export const publicReadLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 180,
+  keyPrefix: "cafemart:ratelimit:public_read",
+  message: "Too many requests. Please slow down.",
+  failClosed: false,
+});
+
+export const publicSearchLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 40,
+  keyPrefix: "cafemart:ratelimit:public_search",
+  message: "Too many search requests. Please try again in a minute.",
+  failClosed: false,
   keyGenerator: (req) => {
-    const uid = req.user?._id ? String(req.user._id) : getTrustedClientIp(req);
-    return uid;
+    const search = req.query?.search;
+    if (typeof search === "string" && search.trim().length > 0) {
+      return getTrustedClientIp(req);
+    }
+    return null;
   },
+});
+
+export const cartLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  keyPrefix: "cafemart:ratelimit:cart",
+  message: "Too many cart requests. Please slow down.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const orderReadLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  keyPrefix: "cafemart:ratelimit:order_read",
+  message: "Too many order read requests. Please slow down.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const orderWriteLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 30,
+  keyPrefix: "cafemart:ratelimit:order_write",
+  message: "Too many order modification requests. Please wait a moment.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const cafeOwnerLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 60,
+  keyPrefix: "cafemart:ratelimit:cafe_owner",
+  message: "Too many cafe management requests. Please slow down.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const uploadLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 15,
+  keyPrefix: "cafemart:ratelimit:upload",
+  message: "Too many upload requests. Please wait before uploading again.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const adminReadLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  keyPrefix: "cafemart:ratelimit:admin_read",
+  message: "Too many admin read requests. Please slow down.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
+});
+
+export const adminMutationLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 40,
+  keyPrefix: "cafemart:ratelimit:admin_mutation",
+  message: "Too many admin write requests. Please slow down.",
+  failClosed: protectedFailClosed(),
+  keyGenerator: userScopedKeyGenerator,
 });

@@ -111,7 +111,7 @@ router.post("/apple", authGeneralLimiter, appleLogin);
  *         description: Cafe Owner Google authentication successful
  *         content:
  *           application/json:
- *             schema: { $ref: '#/components/schemas/AuthResponse' }
+ *             schema: { $ref: '#/components/schemas/CafeOwnerAuthResponse' }
  *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       403: { $ref: '#/components/responses/Forbidden' }
@@ -143,7 +143,7 @@ router.post("/cafe-owner/google", authGeneralLimiter, cafeOwnerGoogleLogin);
  *         description: Cafe Owner Apple authentication successful
  *         content:
  *           application/json:
- *             schema: { $ref: '#/components/schemas/AuthResponse' }
+ *             schema: { $ref: '#/components/schemas/CafeOwnerAuthResponse' }
  *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       403: { $ref: '#/components/responses/Forbidden' }
@@ -283,6 +283,18 @@ router.post("/logout", authGeneralLimiter, authenticate, logout);
  *     responses:
  *       200:
  *         description: All sessions revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: All sessions revoked successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     revokedSessions: { type: integer, example: 3 }
+ *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  */
 router.post("/logout-all", authGeneralLimiter, authenticate, logoutAll);
@@ -295,9 +307,30 @@ router.post("/logout-all", authGeneralLimiter, authenticate, logoutAll);
  *     summary: List active device sessions for the authenticated user
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, minimum: 1, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
  *     responses:
  *       200:
  *         description: Active sessions fetched successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Active sessions fetched successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessions:
+ *                       type: array
+ *                       items: { $ref: '#/components/schemas/SessionView' }
+ *                     pagination: { $ref: '#/components/schemas/PagePagination' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  */
 router.get("/sessions", authGeneralLimiter, authenticate, listActiveSessions);
@@ -313,6 +346,14 @@ router.get("/sessions", authGeneralLimiter, authenticate, listActiveSessions);
  *     responses:
  *       200:
  *         description: Current session fetched successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Current session fetched successfully }
+ *                 data: { $ref: '#/components/schemas/SessionView' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       404: { $ref: '#/components/responses/NotFound' }
  */
@@ -339,6 +380,20 @@ router.get(
  *     responses:
  *       200:
  *         description: Device session revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Device session revoked successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId: { type: string }
+ *                     status: { type: string, enum: [ACTIVE, REVOKED, EXPIRED] }
+ *                     alreadyRevoked: { type: boolean, example: false }
+ *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       404: { $ref: '#/components/responses/NotFound' }
  */

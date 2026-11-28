@@ -42,6 +42,7 @@ import { registerAuthHandlers } from "./handlers/auth.handler.js";
 import { registerOrderHandlers } from "./handlers/order.handler.js";
 import { registerCafeHandlers } from "./handlers/cafe.handler.js";
 import {
+  stopPresenceRefresh,
   trackPresenceConnect,
   trackPresenceDisconnect,
 } from "./services/socketPresence.service.js";
@@ -53,6 +54,7 @@ export interface SocketServerInitOptions {
 
 export interface SocketHealthStatus {
   initialized: boolean;
+  workerId: string;
   serverCount: number;
   connectedSockets: number;
   redisAdapterAttached: boolean;
@@ -89,26 +91,33 @@ const ACQUIRE_SOCKET_SLOT_LUA = `
 local key = KEYS[1]
 local member = ARGV[1]
 local limit = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
-local current = redis.call('SCARD', key)
+local nowMs = tonumber(ARGV[3])
+local expiresAtMs = tonumber(ARGV[4])
+local ttlSec = tonumber(ARGV[5])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', nowMs)
+local current = tonumber(redis.call('ZCARD', key) or 0)
 if current >= limit then
   return { 0, current }
 end
-redis.call('SADD', key, member)
-redis.call('EXPIRE', key, ttl)
+redis.call('ZADD', key, expiresAtMs, member)
+redis.call('PEXPIRE', key, ttlSec * 1000)
 return { 1, current + 1 }
 `;
 
 const RELEASE_SOCKET_SLOT_LUA = `
 local key = KEYS[1]
 local member = ARGV[1]
-redis.call('SREM', key, member)
-local remaining = redis.call('SCARD', key)
+local nowMs = tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', nowMs)
+redis.call('ZREM', key, member)
+local remaining = tonumber(redis.call('ZCARD', key) or 0)
 if remaining == 0 then
   redis.call('DEL', key)
 end
 return remaining
 `;
+
+const SOCKET_SLOT_TTL_SEC = 3600;
 
 const trackUserSocketConnect = async (
   io: AppSocketServer,
@@ -130,10 +139,12 @@ const trackUserSocketConnect = async (
 
   if (isRedisAvailable()) {
     try {
+      const nowMs = Date.now();
+      const expiresAtMs = nowMs + SOCKET_SLOT_TTL_SEC * 1000;
       const res = await redisEval<[number, number]>(
         ACQUIRE_SOCKET_SLOT_LUA,
         [redisKeys.socketUserConns(userId)],
-        [socketId, limit, 3600],
+        [socketId, limit, nowMs, expiresAtMs, SOCKET_SLOT_TTL_SEC],
       );
       const allowed = Number(res[0]) === 1;
       const currentCount = Number(res[1]);
@@ -173,7 +184,7 @@ const untrackUserSocket = (
     void redisEval<number>(
       RELEASE_SOCKET_SLOT_LUA,
       [redisKeys.socketUserConns(userId)],
-      [socketId],
+      [socketId, Date.now()],
     ).catch(() => {});
   }
 };
@@ -220,6 +231,18 @@ const attachRedisAdapterIfReady = async (
       logger.warn("[socket] Redis adapter subClient error", {
         error: err.message,
       });
+    });
+
+    pubClient.on("reconnecting", () => {
+      logger.warn("[socket] Redis adapter pubClient reconnecting");
+    });
+
+    subClient.on("reconnecting", () => {
+      logger.warn("[socket] Redis adapter subClient reconnecting");
+    });
+
+    subClient.on("ready", () => {
+      logger.info("[socket] Redis adapter subClient ready");
     });
 
     await Promise.all([pubClient.connect(), subClient.connect()]);
@@ -328,7 +351,7 @@ export const initSocketServer = async (
 
     try {
       await joinDefaultIdentityRooms(socket);
-      trackPresenceConnect(socket.data.userId);
+      trackPresenceConnect(socket.data.userId, socket.id);
       scheduleTokenExpiryTimer(socket);
 
       registerAuthHandlers(socket);
@@ -348,7 +371,7 @@ export const initSocketServer = async (
 
       socket.on("disconnect", (reason) => {
         untrackUserSocket(io, socket.data.userId, socket.id);
-        trackPresenceDisconnect(socket.data.userId);
+        trackPresenceDisconnect(socket.data.userId, socket.id);
         clearTokenExpiryTimer(socket.id);
         logger.debug("[socket] Client disconnected", {
           socketId: socket.id,
@@ -368,6 +391,7 @@ export const initSocketServer = async (
       });
     } catch (err) {
       untrackUserSocket(io, socket.data.userId, socket.id);
+      trackPresenceDisconnect(socket.data.userId, socket.id);
       logger.error("[socket] Failed during connection setup", {
         socketId: socket.id,
         userId: socket.data.userId,
@@ -403,6 +427,10 @@ export const getSocketHealthStatus = (): SocketHealthStatus => {
 
   return {
     initialized: servers.length > 0,
+    workerId:
+      process.env.NODE_APP_INSTANCE?.trim() ||
+      process.env.pm_id?.trim() ||
+      "primary",
     serverCount: servers.length,
     connectedSockets,
     redisAdapterAttached,
@@ -460,6 +488,7 @@ export const closeSocketServerInstance = async (
 };
 
 export const closeSocketServer = async (): Promise<void> => {
+  stopPresenceRefresh();
   clearAllTokenExpiryTimers();
   await stopRevocationSubscription();
 

@@ -21,10 +21,14 @@ export const SOCKET_EVENTS = {
   PAYMENT_REFUNDED: "payment:refunded",
   PAYMENT_STATUS_UPDATED: "payment:status_updated",
 
+  CART_UPDATED: "cart:updated",
+  CART_CLEARED: "cart:cleared",
+
   CAFE_SUBSCRIBE: "cafe:subscribe",
   CAFE_UNSUBSCRIBE: "cafe:unsubscribe",
   CAFE_APPROVAL_UPDATED: "cafe:approval_updated",
   CAFE_OPEN_STATUS_CHANGED: "cafe:open_status_changed",
+  CAFE_MENU_UPDATED: "cafe:menu_updated",
   CAFE_PROFILE_UPDATED: "cafe:profile_updated",
 } as const;
 
