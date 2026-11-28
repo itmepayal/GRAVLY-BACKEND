@@ -335,13 +335,26 @@ export const createApp = (): express.Application => {
     configuredSwaggerKey.length >= 16;
 
   if (swaggerEnabled) {
+    const swaggerServerOrigins = Array.isArray(
+      (swaggerSpec as { servers?: Array<{ url?: string }> }).servers,
+    )
+      ? ((swaggerSpec as { servers?: Array<{ url?: string }> }).servers ?? [])
+          .map((server) => extractOrigin(server?.url))
+          .filter((origin): origin is string => Boolean(origin))
+      : [];
+
     const swaggerCsp = helmet.contentSecurityPolicy({
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", "'unsafe-inline'"],
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:", "https:"],
-        connectSrc: ["'self'", ...getAllowedOrigins()],
+        connectSrc: [
+          "'self'",
+          ...Array.from(
+            new Set([...getAllowedOrigins(), ...swaggerServerOrigins]),
+          ),
+        ],
         objectSrc: ["'none'"],
         frameAncestors: ["'none'"],
         baseUri: ["'self'"],

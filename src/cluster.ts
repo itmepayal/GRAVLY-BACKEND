@@ -2,6 +2,7 @@ import cluster from "node:cluster";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import "./config/index.js";
 import logger from "./config/logger.config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

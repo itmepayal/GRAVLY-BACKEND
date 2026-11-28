@@ -1,6 +1,22 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 
-dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const backendRoot = path.resolve(__dirname, "../..");
+
+export function loadEnv(): void {
+  const nodeEnvValue = process.env.NODE_ENV?.trim();
+  const envFileName =
+    nodeEnvValue === "production" ? ".env.production" : ".env";
+  const envFilePath = path.join(backendRoot, envFileName);
+  if (fs.existsSync(envFilePath)) {
+    dotenv.config({ path: envFilePath });
+  }
+}
+
+loadEnv();
 
 type ServerConfig = {
   NODE_ENV: string;
@@ -265,17 +281,28 @@ function validateRedisEnv(nodeEnvValue: string): {
   return { redisUrl, upstashRestUrl, upstashRestToken };
 }
 
-function loadEnv(): void {
-  dotenv.config();
-}
-
-loadEnv();
-
-const nodeEnv = process.env.NODE_ENV || "development";
+const nodeEnv = process.env.NODE_ENV?.trim() || "development";
 const clientUrl = getEnv("CLIENT_URL");
 const corsOrigin = getEnv("CORS_ORIGIN");
 const corsOrigins = parseCorsOrigins(corsOrigin, clientUrl);
 const validatedRedis = validateRedisEnv(nodeEnv);
+
+const getRedisEnvValue = (
+  canonicalKey: string,
+  legacyKey: string,
+): string | undefined =>
+  process.env[canonicalKey]?.trim() || process.env[legacyKey]?.trim() || undefined;
+
+const resolveRedisBool = (
+  canonicalKey: string,
+  legacyKey: string,
+  defaultTrue: boolean,
+): boolean => {
+  const raw =
+    process.env[canonicalKey]?.trim() ?? process.env[legacyKey]?.trim();
+  if (raw === undefined) return defaultTrue;
+  return defaultTrue ? raw !== "false" : raw === "true";
+};
 
 export const serverConfig: ServerConfig = {
   NODE_ENV: nodeEnv,
@@ -328,34 +355,43 @@ export const serverConfig: ServerConfig = {
   REDIS_PORT: Number(process.env.REDIS_PORT) || 6379,
   REDIS_USERNAME: process.env.REDIS_USERNAME || undefined,
   REDIS_PASSWORD: process.env.REDIS_PASSWORD || undefined,
-  REDIS_TLS: process.env.REDIS_TLS === "true",
-  REDIS_TLS_REJECT_UNAUTHORIZED:
-    process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== "false",
-  REDIS_REVOCATION_FAIL_CLOSED:
-    process.env.REDIS_REVOCATION_FAIL_CLOSED !== "false",
+  REDIS_TLS: resolveRedisBool("REDIS_TLS", "UPSTASH_REDIS_TLS", false),
+  REDIS_TLS_REJECT_UNAUTHORIZED: resolveRedisBool(
+    "REDIS_TLS_REJECT_UNAUTHORIZED",
+    "UPSTASH_REDIS_TLS_REJECT_UNAUTHORIZED",
+    true,
+  ),
+  REDIS_REVOCATION_FAIL_CLOSED: resolveRedisBool(
+    "REDIS_REVOCATION_FAIL_CLOSED",
+    "UPSTASH_REDIS_REVOCATION_FAIL_CLOSED",
+    true,
+  ),
   REDIS_COMMAND_TIMEOUT_MS: parseBoundedInt(
-    process.env.REDIS_COMMAND_TIMEOUT_MS,
+    getRedisEnvValue("REDIS_COMMAND_TIMEOUT_MS", "UPSTASH_REDIS_COMMAND_TIMEOUT_MS"),
     2000,
     100,
     60000,
     "REDIS_COMMAND_TIMEOUT_MS",
   ),
   REDIS_CONNECT_TIMEOUT_MS: parseBoundedInt(
-    process.env.REDIS_CONNECT_TIMEOUT_MS,
+    getRedisEnvValue("REDIS_CONNECT_TIMEOUT_MS", "UPSTASH_REDIS_CONNECT_TIMEOUT_MS"),
     5000,
     500,
     60000,
     "REDIS_CONNECT_TIMEOUT_MS",
   ),
   REDIS_REST_TIMEOUT_MS: parseBoundedInt(
-    process.env.REDIS_REST_TIMEOUT_MS,
+    getRedisEnvValue("REDIS_REST_TIMEOUT_MS", "UPSTASH_REDIS_REST_TIMEOUT_MS"),
     3000,
     200,
     60000,
     "REDIS_REST_TIMEOUT_MS",
   ),
   REDIS_MAX_RETRIES_PER_REQUEST: parseBoundedInt(
-    process.env.REDIS_MAX_RETRIES_PER_REQUEST,
+    getRedisEnvValue(
+      "REDIS_MAX_RETRIES_PER_REQUEST",
+      "UPSTASH_REDIS_MAX_RETRIES_PER_REQUEST",
+    ),
     2,
     0,
     10,

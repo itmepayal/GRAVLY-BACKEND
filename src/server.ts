@@ -1,9 +1,9 @@
 import http, { type Server } from "http";
 
+import { serverConfig } from "./config/index.js";
 import { connectDB } from "./config/db.config.js";
 import { initRedis, closeRedis } from "./config/redis.config.js";
 import logger, { flushLoggers } from "./config/logger.config.js";
-import { serverConfig } from "./config/index.js";
 import createApp, { markServerDraining } from "./app/app.js";
 import { initSocketServer, closeSocketServer } from "./socket/index.js";
 import { startBackgroundJobs, stopBackgroundJobs } from "./job/index.js";
@@ -120,16 +120,16 @@ const startServer = async (): Promise<void> => {
     await initSocketServer(httpServer);
 
     httpServer.listen(serverConfig.PORT, "0.0.0.0", () => {
+      const configuredBaseUrl = serverConfig.SERVER_URL.replace(/\/+$/, "");
       logger.info(`Gravly Backend running on port ${serverConfig.PORT}`, {
         pid: process.pid,
+        env: serverConfig.NODE_ENV,
         workerIndex: process.env.NODE_APP_INSTANCE ?? "standalone",
       });
 
-      logger.info(`Health check: http://localhost:${serverConfig.PORT}/health`);
+      logger.info(`Health check: ${configuredBaseUrl}/health`);
 
-      logger.info(
-        `API documentation: http://localhost:${serverConfig.PORT}/docs`,
-      );
+      logger.info(`API documentation: ${configuredBaseUrl}/docs`);
 
       logger.info("Press Ctrl+C to stop the server.");
 
