@@ -5,12 +5,22 @@ import {
   adminLogin,
   refreshAccessToken,
   logout,
+  logoutAll,
+  listActiveSessions,
+  getCurrentSession,
+  revokeDeviceSession,
   googleLogin,
   appleLogin,
   cafeOwnerGoogleLogin,
   cafeOwnerAppleLogin,
 } from "../../controllers/auth.controller.js";
 import { authenticate } from "../../middlewares/authenticate.middleware.js";
+import {
+  adminLoginLimiter,
+  adminRegisterLimiter,
+  refreshTokenLimiter,
+  authGeneralLimiter,
+} from "../../middlewares/rateLimiter.middleware.js";
 
 const router = Router();
 
@@ -43,7 +53,7 @@ const router = Router();
  *       403: { $ref: '#/components/responses/Forbidden' }
  *       409: { $ref: '#/components/responses/Conflict' }
  */
-router.post("/google", googleLogin);
+router.post("/google", authGeneralLimiter, googleLogin);
 
 /**
  * @openapi
@@ -77,7 +87,7 @@ router.post("/google", googleLogin);
  *       403: { $ref: '#/components/responses/Forbidden' }
  *       409: { $ref: '#/components/responses/Conflict' }
  */
-router.post("/apple", appleLogin);
+router.post("/apple", authGeneralLimiter, appleLogin);
 
 /**
  * @openapi
@@ -101,13 +111,13 @@ router.post("/apple", appleLogin);
  *         description: Cafe Owner Google authentication successful
  *         content:
  *           application/json:
- *             schema: { $ref: '#/components/schemas/AuthResponse' }
+ *             schema: { $ref: '#/components/schemas/CafeOwnerAuthResponse' }
  *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       403: { $ref: '#/components/responses/Forbidden' }
  *       409: { $ref: '#/components/responses/Conflict' }
  */
-router.post("/cafe-owner/google", cafeOwnerGoogleLogin);
+router.post("/cafe-owner/google", authGeneralLimiter, cafeOwnerGoogleLogin);
 
 /**
  * @openapi
@@ -133,13 +143,13 @@ router.post("/cafe-owner/google", cafeOwnerGoogleLogin);
  *         description: Cafe Owner Apple authentication successful
  *         content:
  *           application/json:
- *             schema: { $ref: '#/components/schemas/AuthResponse' }
+ *             schema: { $ref: '#/components/schemas/CafeOwnerAuthResponse' }
  *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       403: { $ref: '#/components/responses/Forbidden' }
  *       409: { $ref: '#/components/responses/Conflict' }
  */
-router.post("/cafe-owner/apple", cafeOwnerAppleLogin);
+router.post("/cafe-owner/apple", authGeneralLimiter, cafeOwnerAppleLogin);
 
 /**
  * @openapi
@@ -170,7 +180,7 @@ router.post("/cafe-owner/apple", cafeOwnerAppleLogin);
  *       403: { $ref: '#/components/responses/Forbidden' }
  *       409: { $ref: '#/components/responses/Conflict' }
  */
-router.post("/admin/register", adminRegister);
+router.post("/admin/register", adminRegisterLimiter, adminRegister);
 
 /**
  * @openapi
@@ -198,7 +208,7 @@ router.post("/admin/register", adminRegister);
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       403: { $ref: '#/components/responses/Forbidden' }
  */
-router.post("/admin/login", adminLogin);
+router.post("/admin/login", adminLoginLimiter, adminLogin);
 
 /**
  * @openapi
@@ -226,7 +236,7 @@ router.post("/admin/login", adminLogin);
  *       401: { $ref: '#/components/responses/Unauthorized' }
  *       403: { $ref: '#/components/responses/Forbidden' }
  */
-router.post("/refresh-token", refreshAccessToken);
+router.post("/refresh-token", refreshTokenLimiter, refreshAccessToken);
 
 /**
  * @openapi
@@ -259,6 +269,139 @@ router.post("/refresh-token", refreshAccessToken);
  *       400: { $ref: '#/components/responses/BadRequest' }
  *       401: { $ref: '#/components/responses/Unauthorized' }
  */
-router.post("/logout", authenticate, logout);
+router.post("/logout", authGeneralLimiter, authenticate, logout);
+
+/**
+ * @openapi
+ * /auth/logout-all:
+ *   post:
+ *     tags: [Authentication]
+ *     summary: Logout from all active sessions
+ *     description: Revokes all refresh tokens and active access tokens for the authenticated user.
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: All sessions revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: All sessions revoked successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     revokedSessions: { type: integer, example: 3 }
+ *       400: { $ref: '#/components/responses/BadRequest' }
+ *       401: { $ref: '#/components/responses/Unauthorized' }
+ */
+router.post("/logout-all", authGeneralLimiter, authenticate, logoutAll);
+
+/**
+ * @openapi
+ * /auth/sessions:
+ *   get:
+ *     tags: [Authentication]
+ *     summary: List active device sessions for the authenticated user
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, minimum: 1, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+ *     responses:
+ *       200:
+ *         description: Active sessions fetched successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Active sessions fetched successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessions:
+ *                       type: array
+ *                       items: { $ref: '#/components/schemas/SessionView' }
+ *                     pagination: { $ref: '#/components/schemas/PagePagination' }
+ *       401: { $ref: '#/components/responses/Unauthorized' }
+ */
+router.get("/sessions", authGeneralLimiter, authenticate, listActiveSessions);
+
+/**
+ * @openapi
+ * /auth/sessions/current:
+ *   get:
+ *     tags: [Authentication]
+ *     summary: Get metadata for the current authenticated session
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Current session fetched successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Current session fetched successfully }
+ *                 data: { $ref: '#/components/schemas/SessionView' }
+ *       401: { $ref: '#/components/responses/Unauthorized' }
+ *       404: { $ref: '#/components/responses/NotFound' }
+ */
+router.get(
+  "/sessions/current",
+  authGeneralLimiter,
+  authenticate,
+  getCurrentSession,
+);
+
+/**
+ * @openapi
+ * /auth/sessions/{sessionId}:
+ *   delete:
+ *     tags: [Authentication]
+ *     summary: Revoke a specific device session
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Device session revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: Device session revoked successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId: { type: string }
+ *                     status: { type: string, enum: [ACTIVE, REVOKED, EXPIRED] }
+ *                     alreadyRevoked: { type: boolean, example: false }
+ *       400: { $ref: '#/components/responses/BadRequest' }
+ *       401: { $ref: '#/components/responses/Unauthorized' }
+ *       404: { $ref: '#/components/responses/NotFound' }
+ */
+router.delete(
+  "/sessions/:sessionId",
+  authGeneralLimiter,
+  authenticate,
+  revokeDeviceSession,
+);
 
 export default router;

@@ -10,6 +10,11 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
+import {
+  paymentInitiateLimiter,
+  paymentStatusLimiter,
+  paymentWebhookLimiter,
+} from "../../middlewares/rateLimiter.middleware.js";
 
 const STUDENT = "student";
 
@@ -41,6 +46,12 @@ const studentOnly = [authenticate, authorize(STUDENT)];
  *       If a pending payment already exists for this order, the same session is returned.
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: header
+ *         name: Idempotency-Key
+ *         required: false
+ *         schema: { type: string }
+ *         description: Optional idempotency key to prevent duplicate payment session creation
  *     requestBody:
  *       required: true
  *       content:
@@ -87,7 +98,7 @@ const studentOnly = [authenticate, authorize(STUDENT)];
  *       500:
  *         description: Internal server error
  */
-router.post("/initiate", ...studentOnly, initiatePayment);
+router.post("/initiate", ...studentOnly, paymentInitiateLimiter, initiatePayment);
 
 /**
  * @openapi
@@ -125,16 +136,24 @@ router.post("/initiate", ...studentOnly, initiatePayment);
  *                   type: object
  *                   properties:
  *                     orderId: { type: string }
- *                     orderStatus: { type: string }
+ *                     orderStatus:
+ *                       type: string
+ *                       enum: [pending, confirmed, preparing, ready, delivered, cancelled, rejected]
  *                     paymentMethod: { type: string, enum: [cash, online] }
- *                     paymentStatus: { type: string }
+ *                     paymentStatus:
+ *                       type: string
+ *                       enum: [pending, paid, failed, refunded]
  *                     payment:
  *                       type: object
  *                       nullable: true
  *                       properties:
  *                         paymentId: { type: string }
- *                         status: { type: string }
- *                         method: { type: string }
+ *                         status:
+ *                           type: string
+ *                           enum: [pending, success, failed, refunded]
+ *                         method:
+ *                           type: string
+ *                           enum: [card, upi, wallet, cashfree, cash]
  *                         amount: { type: number }
  *                         transactionId: { type: string, nullable: true }
  *                         paidAt: { type: string, format: date-time, nullable: true }
@@ -149,7 +168,7 @@ router.post("/initiate", ...studentOnly, initiatePayment);
  *       500:
  *         description: Internal server error
  */
-router.get("/status/:orderId", ...studentOnly, getPaymentStatus);
+router.get("/status/:orderId", ...studentOnly, paymentStatusLimiter, getPaymentStatus);
 
 /**
  * @openapi
@@ -193,6 +212,6 @@ router.get("/status/:orderId", ...studentOnly, getPaymentStatus);
  *       500:
  *         description: Internal server error
  */
-router.post("/webhook", cashfreeWebhook);
+router.post("/webhook", paymentWebhookLimiter, cashfreeWebhook);
 
 export default router;

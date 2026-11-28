@@ -13,10 +13,11 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
+import { cartLimiter } from "../../middlewares/rateLimiter.middleware.js";
 
 const router = Router();
 
-const studentOnly = [authenticate, authorize("student")];
+const studentOnly = [authenticate, authorize("student"), cartLimiter];
 
 /**
  * @openapi
@@ -62,7 +63,10 @@ const studentOnly = [authenticate, authorize("student")];
  *       properties:
  *         menuItem: { type: string }
  *         name: { type: string, example: Cold Coffee }
- *         image: { type: object, nullable: true, properties: { url: { type: string } } }
+ *         image:
+ *           allOf:
+ *             - $ref: '#/components/schemas/FileObject'
+ *           nullable: true
  *         isVeg: { type: boolean }
  *         price: { type: number, example: 80 }
  *         quantity: { type: integer, example: 2 }

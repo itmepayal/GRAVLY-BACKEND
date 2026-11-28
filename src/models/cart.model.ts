@@ -72,9 +72,16 @@ const cartSchema = new Schema<ICart>(
       default: "active",
     },
   },
-  { timestamps: true },
+  { timestamps: true, optimisticConcurrency: true },
 );
 
 cartSchema.index({ student: 1, status: 1 });
+cartSchema.index(
+  { student: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { status: "active" },
+  },
+);
 
 export const Cart = model<ICart>("Cart", cartSchema);

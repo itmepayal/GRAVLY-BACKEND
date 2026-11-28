@@ -4,13 +4,17 @@ import { Cafe } from "../models/cafe.model.js";
 import { MenuItem } from "../models/menuItem.model.js";
 import {
   uploadImage,
+  deleteFromCloudinary,
   type CloudinaryFile,
 } from "../config/cloudinary.config.js";
+import { logger } from "../config/logger.config.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
 } from "../utils/errors/app.error.js";
+import { invalidatePublicMenuCaches } from "./cafe.service.js";
+import { emitCafeMenuUpdatedEvent } from "../socket/index.js";
 
 /* =====================================================
    HELPERS
@@ -26,8 +30,14 @@ const toBool = (v: unknown, field: string): boolean => {
 };
 
 const toNumber = (v: unknown, field: string): number => {
+  if (typeof v !== "number" && typeof v !== "string") {
+    throw new BadRequestError(`${field} must be a valid number`);
+  }
+  if (typeof v === "string" && !v.trim()) {
+    throw new BadRequestError(`${field} must be a valid number`);
+  }
   const n = Number(v);
-  if (v === "" || v === null || !Number.isFinite(n)) {
+  if (!Number.isFinite(n)) {
     throw new BadRequestError(`${field} must be a valid number`);
   }
   return n;
@@ -97,6 +107,19 @@ export const createMenuItemService = async (
 
   const name = str(b.name);
   if (!name) throw new BadRequestError("Item name is required");
+  if (name.length > 150) {
+    throw new BadRequestError("Item name must not exceed 150 characters");
+  }
+
+  const description = str(b.description);
+  if (description.length > 1000) {
+    throw new BadRequestError("Description must not exceed 1000 characters");
+  }
+
+  const category = str(b.category) || "General";
+  if (category.length > 100) {
+    throw new BadRequestError("Category must not exceed 100 characters");
+  }
 
   const price = toNumber(b.price, "price");
   if (price < 0) throw new BadRequestError("Price cannot be negative");
@@ -120,9 +143,9 @@ export const createMenuItemService = async (
     const item = await MenuItem.create({
       cafe: cafeId,
       name,
-      description: str(b.description) || undefined,
+      description: description || undefined,
       price,
-      category: str(b.category) || "General",
+      category,
       isVeg: b.isVeg === undefined ? true : toBool(b.isVeg, "isVeg"),
       isAvailable:
         b.isAvailable === undefined
@@ -133,8 +156,35 @@ export const createMenuItemService = async (
       ...(image && { image: { url: image.url, publicId: image.publicId } }),
     });
 
+    await invalidatePublicMenuCaches(String(cafeId));
+    emitCafeMenuUpdatedEvent({
+      cafeId: String(cafeId),
+      menuItemId: String(item._id),
+      action: "created",
+      isAvailable: item.isAvailable,
+      stock: item.stock,
+    });
+    logger.info("Menu item created", {
+      cafeId: String(cafeId),
+      itemId: String(item._id),
+      price: item.price,
+      operation: "MENU_CREATE",
+    });
     return withStatus(item.toObject());
   } catch (error) {
+    if (image?.publicId) {
+      await deleteFromCloudinary(image.publicId, "image", false).catch(
+        (cleanupErr: unknown) => {
+          logger.warn("Best-effort menu image rollback cleanup failed", {
+            publicId: image.publicId,
+            error:
+              cleanupErr instanceof Error
+                ? cleanupErr.message
+                : String(cleanupErr),
+          });
+        },
+      );
+    }
     return duplicateGuard(error);
   }
 };
@@ -172,6 +222,7 @@ export const listMyMenuService = async (
 
   const items = await MenuItem.find(filter)
     .sort({ category: 1, name: 1 })
+    .limit(500)
     .lean();
 
   return items.map(withStatus);
@@ -198,11 +249,24 @@ export const updateMenuItemService = async (
   if (b.name !== undefined) {
     const name = str(b.name);
     if (!name) throw new BadRequestError("Item name cannot be empty");
+    if (name.length > 150) {
+      throw new BadRequestError("Item name must not exceed 150 characters");
+    }
     update.name = name;
   }
-  if (b.description !== undefined) update.description = str(b.description);
+  if (b.description !== undefined) {
+    const description = str(b.description);
+    if (description.length > 1000) {
+      throw new BadRequestError("Description must not exceed 1000 characters");
+    }
+    update.description = description;
+  }
   if (b.category !== undefined) {
-    update.category = str(b.category) || "General";
+    const category = str(b.category) || "General";
+    if (category.length > 100) {
+      throw new BadRequestError("Category must not exceed 100 characters");
+    }
+    update.category = category;
   }
   if (b.price !== undefined) {
     const price = toNumber(b.price, "price");
@@ -214,8 +278,20 @@ export const updateMenuItemService = async (
     update.trackStock = toBool(b.trackStock, "trackStock");
   }
 
+  let uploadedImagePublicId: string | undefined;
+  let existingOldImagePublicId: string | undefined;
+
   if (file) {
+    const existingItem = await MenuItem.findOne({ _id: itemId, cafe: cafeId })
+      .select("image.publicId")
+      .lean();
+    if (!existingItem) {
+      throw new NotFoundError("Menu item not found");
+    }
+    existingOldImagePublicId = existingItem.image?.publicId;
+
     const img = await uploadImage(file, `cafes/${ownerId}/menu`, false);
+    uploadedImagePublicId = img.publicId;
     update.image = { url: img.url, publicId: img.publicId };
   }
 
@@ -231,8 +307,56 @@ export const updateMenuItemService = async (
     ).lean();
 
     if (!item) throw new NotFoundError("Menu item not found");
+
+    if (
+      uploadedImagePublicId &&
+      existingOldImagePublicId &&
+      existingOldImagePublicId !== uploadedImagePublicId
+    ) {
+      await deleteFromCloudinary(
+        existingOldImagePublicId,
+        "image",
+        false,
+      ).catch((cleanupErr: unknown) => {
+        logger.warn("Best-effort old menu image cleanup failed", {
+          publicId: existingOldImagePublicId,
+          error:
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : String(cleanupErr),
+        });
+      });
+    }
+
+    await invalidatePublicMenuCaches(String(cafeId));
+    emitCafeMenuUpdatedEvent({
+      cafeId: String(cafeId),
+      menuItemId: String(item._id),
+      action: "updated",
+      isAvailable: item.isAvailable,
+      stock: item.stock,
+    });
+    logger.info("Menu item updated", {
+      cafeId: String(cafeId),
+      itemId: String(item._id),
+      updatedFields: Object.keys(update),
+      operation: "MENU_UPDATE",
+    });
     return withStatus(item);
   } catch (error) {
+    if (uploadedImagePublicId) {
+      await deleteFromCloudinary(uploadedImagePublicId, "image", false).catch(
+        (cleanupErr: unknown) => {
+          logger.warn("Best-effort new menu image rollback cleanup failed", {
+            publicId: uploadedImagePublicId,
+            error:
+              cleanupErr instanceof Error
+                ? cleanupErr.message
+                : String(cleanupErr),
+          });
+        },
+      );
+    }
     if (error instanceof NotFoundError) throw error;
     return duplicateGuard(error);
   }
@@ -256,6 +380,20 @@ export const setMenuAvailabilityService = async (
   ).lean();
 
   if (!item) throw new NotFoundError("Menu item not found");
+  await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "availability_toggled",
+    isAvailable: item.isAvailable,
+    stock: item.stock,
+  });
+  logger.info("Menu item availability updated", {
+    cafeId: String(cafeId),
+    itemId,
+    isAvailable,
+    operation: "MENU_AVAILABILITY",
+  });
   return withStatus(item);
 };
 
@@ -317,6 +455,21 @@ export const updateMenuStockService = async (
     throw new ConflictError("Not enough stock for this adjustment");
   }
 
+  await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "stock_updated",
+    isAvailable: item.isAvailable,
+    stock: item.stock,
+  });
+  logger.info("Menu item stock updated", {
+    cafeId: String(cafeId),
+    itemId,
+    stock: item.stock,
+    trackStock: item.trackStock,
+    operation: "MENU_STOCK_UPDATE",
+  });
   return withStatus(item);
 };
 
@@ -333,6 +486,31 @@ export const deleteMenuItemService = async (
   const item = await MenuItem.findOneAndDelete({ _id: itemId, cafe: cafeId });
   if (!item) throw new NotFoundError("Menu item not found");
 
+  if (item.image?.publicId) {
+    await deleteFromCloudinary(item.image.publicId, "image", false).catch(
+      (cleanupErr: unknown) => {
+        logger.warn("Best-effort deleted menu image cleanup failed", {
+          publicId: item.image?.publicId,
+          error:
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : String(cleanupErr),
+        });
+      },
+    );
+  }
+
+  await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "deleted",
+  });
+  logger.info("Menu item deleted", {
+    cafeId: String(cafeId),
+    itemId,
+    operation: "MENU_DELETE",
+  });
   return { _id: item._id, name: item.name };
 };
 
@@ -346,6 +524,14 @@ export const setMenuStockStatusService = async (
   stock?: number,
 ) => {
   assertObjectId(itemId, "item ID");
+  if (stock !== undefined) {
+    if (!inStock) {
+      throw new BadRequestError("stock can only be sent when inStock is true");
+    }
+    if (!Number.isInteger(stock) || stock < 1) {
+      throw new BadRequestError("stock must be a positive integer");
+    }
+  }
   const cafeId = await getOwnerCafeId(ownerId);
 
   const current = await MenuItem.findOne({ _id: itemId, cafe: cafeId }).lean();
@@ -374,5 +560,20 @@ export const setMenuStockStatusService = async (
 
   if (!item) throw new NotFoundError("Menu item not found");
 
+  await invalidatePublicMenuCaches(String(cafeId));
+  emitCafeMenuUpdatedEvent({
+    cafeId: String(cafeId),
+    menuItemId: itemId,
+    action: "stock_updated",
+    isAvailable: item.isAvailable,
+    stock: item.stock,
+  });
+  logger.info("Menu item stock updated", {
+    cafeId: String(cafeId),
+    itemId,
+    stock: item.stock,
+    trackStock: item.trackStock,
+    operation: "MENU_STOCK_UPDATE",
+  });
   return withStatus(item);
 };

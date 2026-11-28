@@ -1,21 +1,102 @@
 import crypto from "crypto";
 import { Types } from "mongoose";
 
-import { Cafe, IFile } from "../models/cafe.model.js";
+import { Cafe, type CafeApprovalStatus, IFile } from "../models/cafe.model.js";
 
 import {
   uploadImage,
   signedUrl,
+  deleteFromCloudinary,
   type CloudinaryFile,
   type CloudinaryUploadResult,
 } from "../config/cloudinary.config.js";
+import { logger } from "../config/logger.config.js";
 
 import {
   BadRequestError,
   ConflictError,
+  ForbiddenError,
   NotFoundError,
 } from "../utils/errors/app.error.js";
 import { MenuItem } from "../models/menuItem.model.js";
+import {
+  emitCafeApprovalEvent,
+  emitCafeOpenStatusEvent,
+} from "../socket/index.js";
+import {
+  REDIS_TTLS,
+  cacheDeleteKeys,
+  getOrLoadCachedJson,
+  isRedisAvailable,
+  redisGet,
+  redisIncr,
+  redisKeys,
+} from "../infrastructure/redis/index.js";
+import { invalidateCafeIdCache } from "../utils/order/requestUser.js";
+
+export interface OrderableCafeMeta {
+  _id: Types.ObjectId | string;
+  name: string;
+  isOpen: boolean;
+  isApproved: boolean;
+  approvalStatus: CafeApprovalStatus;
+  isVisible: boolean;
+  isActive: boolean;
+  deliveryEnabled: boolean;
+  pickupEnabled: boolean;
+  deliveryFee: number;
+  platformFee: number;
+}
+
+export const invalidatePublicCafeListCache = async (): Promise<void> => {
+  if (!isRedisAvailable()) return;
+  try {
+    await redisIncr(redisKeys.publicCafesVersion());
+  } catch {
+    // Best-effort collection cache version bump
+  }
+};
+
+export const invalidatePublicMenuCaches = async (
+  cafeId: string,
+): Promise<void> => {
+  await cacheDeleteKeys(
+    redisKeys.publicMenu(cafeId, false),
+    redisKeys.publicMenu(cafeId, true),
+  );
+};
+
+export const invalidatePublicCafeCaches = async (
+  cafeId: string,
+): Promise<void> => {
+  await Promise.all([
+    cacheDeleteKeys(
+      redisKeys.publicCafe(cafeId),
+      redisKeys.cafeOrderableMeta(cafeId),
+      redisKeys.publicMenu(cafeId, false),
+      redisKeys.publicMenu(cafeId, true),
+    ),
+    invalidatePublicCafeListCache(),
+  ]);
+};
+
+export const getOrderableCafeMeta = async (
+  cafeId: Types.ObjectId | string,
+): Promise<OrderableCafeMeta | null> => {
+  const idStr = String(cafeId);
+  return getOrLoadCachedJson<OrderableCafeMeta | null>(
+    redisKeys.cafeOrderableMeta(idStr),
+    REDIS_TTLS.CAFE_ORDERABLE_META_SEC,
+    async () => {
+      const cafe = await Cafe.findById(idStr)
+        .select(
+          "name isOpen isApproved approvalStatus isVisible isActive deliveryEnabled pickupEnabled deliveryFee platformFee",
+        )
+        .lean<OrderableCafeMeta | null>();
+      return cafe;
+    },
+  );
+};
 
 /* =====================================================
    TYPES
@@ -202,6 +283,43 @@ const toCafeFile = (result: CloudinaryUploadResult): IFile => ({
   publicId: result.publicId,
 });
 
+interface UploadedAssetRef {
+  publicId: string;
+  isPrivate: boolean;
+}
+
+const cleanupCloudinaryAssets = async (
+  assets: UploadedAssetRef[],
+  reason: string,
+): Promise<void> => {
+  const unique = new Map<string, UploadedAssetRef>();
+  for (const asset of assets) {
+    if (asset.publicId && !unique.has(asset.publicId)) {
+      unique.set(asset.publicId, asset);
+    }
+  }
+
+  if (unique.size === 0) {
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    Array.from(unique.values()).map((asset) =>
+      deleteFromCloudinary(asset.publicId, "image", asset.isPrivate),
+    ),
+  );
+
+  for (const res of results) {
+    if (res.status === "rejected") {
+      logger.warn("Best-effort Cloudinary asset cleanup failed", {
+        reason,
+        error:
+          res.reason instanceof Error ? res.reason.message : String(res.reason),
+      });
+    }
+  }
+};
+
 /* =====================================================
    UPLOAD ONE FILE
 ===================================================== */
@@ -210,6 +328,7 @@ const uploadOne = async (
   key: string,
   folder: string,
   isPrivate: boolean,
+  tracker?: UploadedAssetRef[],
 ): Promise<IFile | undefined> => {
   const file = files[key]?.[0];
 
@@ -218,6 +337,7 @@ const uploadOne = async (
   }
 
   const result = await uploadImage(file, folder, isPrivate);
+  tracker?.push({ publicId: result.publicId, isPrivate });
 
   return toCafeFile(result);
 };
@@ -248,7 +368,8 @@ export const createCafeService = async (
     );
   }
 
-  const old = existing?.toObject().documents;
+  const existingSnapshot = existing?.toObject();
+  const old = existingSnapshot?.documents;
 
   const has = (key: string): boolean => Boolean(files[key]?.[0]);
 
@@ -273,36 +394,130 @@ export const createCafeService = async (
     throw new BadRequestError(`Missing documents: ${missing.join(", ")}`);
   }
 
+  const emailTaken = await Cafe.exists({
+    email: data.email,
+    ...(existing ? { _id: { $ne: existing._id } } : {}),
+  });
+  if (emailTaken) {
+    throw new ConflictError("A cafe with this email already exists");
+  }
+
   const base = `cafes/${ownerId}`;
+  const newlyUploadedAssets: UploadedAssetRef[] = [];
 
-  const [
-    logo,
-    cover,
-    panFront,
-    panBack,
-    identityFront,
-    identityBack,
-    foodLicense,
-    cancelledCheque,
-    galleryImages,
-  ] = await Promise.all([
-    uploadOne(files, "logo", `${base}/public`, false),
-    uploadOne(files, "coverImage", `${base}/public`, false),
-    uploadOne(files, "panCardFront", `${base}/documents`, true),
-    uploadOne(files, "panCardBack", `${base}/documents`, true),
-    uploadOne(files, "identityFront", `${base}/documents`, true),
-    uploadOne(files, "identityBack", `${base}/documents`, true),
-    uploadOne(files, "foodLicense", `${base}/documents`, true),
-    uploadOne(files, "cancelledCheque", `${base}/documents`, true),
-
-    Promise.all(
+  const uploadSettled = await Promise.allSettled([
+    uploadOne(files, "logo", `${base}/public`, false, newlyUploadedAssets),
+    uploadOne(
+      files,
+      "coverImage",
+      `${base}/public`,
+      false,
+      newlyUploadedAssets,
+    ),
+    uploadOne(
+      files,
+      "panCardFront",
+      `${base}/documents`,
+      true,
+      newlyUploadedAssets,
+    ),
+    uploadOne(
+      files,
+      "panCardBack",
+      `${base}/documents`,
+      true,
+      newlyUploadedAssets,
+    ),
+    uploadOne(
+      files,
+      "identityFront",
+      `${base}/documents`,
+      true,
+      newlyUploadedAssets,
+    ),
+    uploadOne(
+      files,
+      "identityBack",
+      `${base}/documents`,
+      true,
+      newlyUploadedAssets,
+    ),
+    uploadOne(
+      files,
+      "foodLicense",
+      `${base}/documents`,
+      true,
+      newlyUploadedAssets,
+    ),
+    uploadOne(
+      files,
+      "cancelledCheque",
+      `${base}/documents`,
+      true,
+      newlyUploadedAssets,
+    ),
+    Promise.allSettled(
       (files.galleryImages ?? []).map(async (file) => {
         const result = await uploadImage(file, `${base}/gallery`, false);
-
+        newlyUploadedAssets.push({
+          publicId: result.publicId,
+          isPrivate: false,
+        });
         return toCafeFile(result);
       }),
     ),
   ]);
+
+  const firstSingleFailure = uploadSettled
+    .slice(0, 8)
+    .find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+
+  const galleryOutcome = uploadSettled[8] as PromiseFulfilledResult<
+    PromiseSettledResult<IFile>[]
+  >;
+  const firstGalleryFailure =
+    galleryOutcome.status === "fulfilled"
+      ? (galleryOutcome.value.find((r) => r.status === "rejected") as
+          | PromiseRejectedResult
+          | undefined)
+      : (uploadSettled[8] as PromiseRejectedResult);
+
+  if (firstSingleFailure || firstGalleryFailure) {
+    await cleanupCloudinaryAssets(
+      newlyUploadedAssets,
+      "cafe_upload_partial_failure",
+    );
+    throw (firstSingleFailure ?? firstGalleryFailure)!.reason;
+  }
+
+  const logo = (uploadSettled[0] as PromiseFulfilledResult<IFile | undefined>)
+    .value;
+  const cover = (uploadSettled[1] as PromiseFulfilledResult<IFile | undefined>)
+    .value;
+  const panFront = (
+    uploadSettled[2] as PromiseFulfilledResult<IFile | undefined>
+  ).value;
+  const panBack = (
+    uploadSettled[3] as PromiseFulfilledResult<IFile | undefined>
+  ).value;
+  const identityFront = (
+    uploadSettled[4] as PromiseFulfilledResult<IFile | undefined>
+  ).value;
+  const identityBack = (
+    uploadSettled[5] as PromiseFulfilledResult<IFile | undefined>
+  ).value;
+  const foodLicense = (
+    uploadSettled[6] as PromiseFulfilledResult<IFile | undefined>
+  ).value;
+  const cancelledCheque = (
+    uploadSettled[7] as PromiseFulfilledResult<IFile | undefined>
+  ).value;
+  const galleryImages =
+    galleryOutcome.status === "fulfilled"
+      ? galleryOutcome.value.map(
+          (r) => (r as PromiseFulfilledResult<IFile>).value,
+        )
+      : [];
 
   const documents = {
     panCard: {
@@ -368,13 +583,71 @@ export const createCafeService = async (
       cafeId = created._id as Types.ObjectId;
     }
 
+    if (existingSnapshot) {
+      const replacedAssets: UploadedAssetRef[] = [];
+      if (cover && existingSnapshot.coverImage?.publicId && existingSnapshot.coverImage.publicId !== cover.publicId) {
+        replacedAssets.push({
+          publicId: existingSnapshot.coverImage.publicId,
+          isPrivate: false,
+        });
+      }
+      if (panFront && old?.panCard?.front?.publicId && old.panCard.front.publicId !== panFront.publicId) {
+        replacedAssets.push({ publicId: old.panCard.front.publicId, isPrivate: true });
+      }
+      if (panBack && old?.panCard?.back?.publicId && old.panCard.back.publicId !== panBack.publicId) {
+        replacedAssets.push({ publicId: old.panCard.back.publicId, isPrivate: true });
+      }
+      if (identityFront && old?.identityProof?.front?.publicId && old.identityProof.front.publicId !== identityFront.publicId) {
+        replacedAssets.push({ publicId: old.identityProof.front.publicId, isPrivate: true });
+      }
+      if (identityBack && old?.identityProof?.back?.publicId && old.identityProof.back.publicId !== identityBack.publicId) {
+        replacedAssets.push({ publicId: old.identityProof.back.publicId, isPrivate: true });
+      }
+      if (foodLicense && old?.foodLicense?.publicId && old.foodLicense.publicId !== foodLicense.publicId) {
+        replacedAssets.push({ publicId: old.foodLicense.publicId, isPrivate: true });
+      }
+      if (cancelledCheque && old?.cancelledCheque?.publicId && old.cancelledCheque.publicId !== cancelledCheque.publicId) {
+        replacedAssets.push({ publicId: old.cancelledCheque.publicId, isPrivate: true });
+      }
+      if (galleryImages.length > 0 && Array.isArray(existingSnapshot.galleryImages)) {
+        const newGalleryIds = new Set(galleryImages.map((g) => g.publicId));
+        for (const oldImg of existingSnapshot.galleryImages) {
+          if (oldImg?.publicId && !newGalleryIds.has(oldImg.publicId)) {
+            replacedAssets.push({ publicId: oldImg.publicId, isPrivate: false });
+          }
+        }
+      }
+
+      if (replacedAssets.length > 0) {
+        await cleanupCloudinaryAssets(replacedAssets, "cafe_resubmit_replaced");
+      }
+    }
+
+    await invalidateCafeIdCache(ownerId);
+    logger.info("Cafe application persisted", {
+      cafeId: String(cafeId),
+      ownerId,
+      isResubmission: Boolean(existing),
+      operation: existing ? "CAFE_RESUBMIT" : "CAFE_CREATE",
+    });
     return await Cafe.findById(cafeId).select("-documents");
   } catch (error: unknown) {
+    await cleanupCloudinaryAssets(
+      newlyUploadedAssets,
+      "cafe_db_persistence_failed",
+    );
+
     const mongoError = error as {
       code?: number;
+      keyPattern?: Record<string, unknown>;
     };
 
     if (mongoError?.code === 11000) {
+      if (mongoError.keyPattern && "owner" in mongoError.keyPattern) {
+        throw new ConflictError(
+          "You have already submitted a cafe application",
+        );
+      }
       throw new ConflictError("A cafe with this email or code already exists");
     }
 
@@ -418,15 +691,15 @@ export const getMyCafeService = async (ownerId: string) => {
 };
 
 /* =====================================================
-   ADMIN: SET CAFE OPEN STATUS
-   - Only approved cafes can be opened or closed
+   OWNER: SET CAFE OPEN STATUS
+   - Only the authenticated owner of an approved, active cafe can open or close it
 ===================================================== */
 export const setCafeOpenService = async (
-  cafeId: Types.ObjectId,
+  ownerId: string,
   isOpen: boolean,
 ) => {
-  if (!Types.ObjectId.isValid(cafeId.toString())) {
-    throw new BadRequestError("Invalid cafe ID");
+  if (!Types.ObjectId.isValid(ownerId)) {
+    throw new BadRequestError("Invalid owner ID");
   }
 
   if (typeof isOpen !== "boolean") {
@@ -435,7 +708,7 @@ export const setCafeOpenService = async (
 
   const cafe = await Cafe.findOneAndUpdate(
     {
-      _id: cafeId,
+      owner: ownerId,
       approvalStatus: "approved",
       isApproved: true,
       isActive: true,
@@ -452,18 +725,39 @@ export const setCafeOpenService = async (
   ).select("name isOpen");
 
   if (!cafe) {
-    const exists = await Cafe.exists({
-      _id: cafeId,
-    });
+    const existing = await Cafe.findOne({
+      owner: ownerId,
+    })
+      .select("_id approvalStatus isApproved isActive")
+      .lean();
 
-    if (!exists) {
+    if (!existing) {
       throw new NotFoundError("Cafe not found");
+    }
+
+    if (!existing.isActive) {
+      throw new ForbiddenError("Your cafe account is currently inactive");
     }
 
     throw new ConflictError(
       "Cafe must be approved before it can be opened or closed",
     );
   }
+
+  await invalidatePublicCafeCaches(String(cafe._id));
+
+  emitCafeOpenStatusEvent({
+    cafeId: String(cafe._id),
+    name: cafe.name,
+    isOpen: cafe.isOpen,
+  });
+
+  logger.info("Cafe open status updated by owner", {
+    cafeId: String(cafe._id),
+    ownerId,
+    isOpen: cafe.isOpen,
+    operation: "CAFE_OPEN_STATUS",
+  });
 
   return cafe;
 };
@@ -488,16 +782,22 @@ export const listPublicCafesService = async (query: {
   };
 
   if (query.city?.trim()) {
-    const escapedCity = query.city
-      .trim()
-      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const city = query.city.trim();
+    if (city.length > 100) {
+      throw new BadRequestError("City filter cannot exceed 100 characters");
+    }
+    const escapedCity = city.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
     filter.city = new RegExp(`^${escapedCity}$`, "i");
   }
 
   if (query.search?.trim()) {
+    const search = query.search.trim();
+    if (search.length > 100) {
+      throw new BadRequestError("Search query cannot exceed 100 characters");
+    }
     filter.$text = {
-      $search: query.search.trim(),
+      $search: search,
     };
   }
 
@@ -517,26 +817,50 @@ export const listPublicCafesService = async (query: {
     "platformFee",
   ].join(" ");
 
-  const [items, total] = await Promise.all([
-    Cafe.find(filter)
-      .select(fields)
-      .sort({
-        isOpen: -1,
-        "rating.average": -1,
-      })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
+  const normalizedCity = query.city?.trim().toLowerCase() || "";
+  const normalizedSearch = query.search?.trim().toLowerCase() || "";
+  const queryHash = crypto
+    .createHash("sha256")
+    .update(`${normalizedCity}|${normalizedSearch}|${page}|${limit}`)
+    .digest("hex")
+    .slice(0, 24);
 
-    Cafe.countDocuments(filter),
-  ]);
+  let version = "1";
+  if (isRedisAvailable()) {
+    try {
+      version = (await redisGet(redisKeys.publicCafesVersion())) || "1";
+    } catch {
+      version = "1";
+    }
+  }
 
-  return {
-    items,
-    total,
-    page,
-    pages: Math.ceil(total / limit),
-  };
+  return getOrLoadCachedJson(
+    redisKeys.publicCafesList(version, queryHash),
+    REDIS_TTLS.PUBLIC_CAFE_LIST_SEC,
+    async () => {
+      const items = await Cafe.find(filter)
+        .select(fields)
+        .sort({
+          isOpen: -1,
+          "rating.average": -1,
+        })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean();
+
+      const total =
+        page === 1 && items.length < limit
+          ? items.length
+          : await Cafe.countDocuments(filter);
+
+      return {
+        items,
+        total,
+        page,
+        pages: Math.ceil(total / limit),
+      };
+    },
+  );
 };
 
 /* =====================================================
@@ -547,38 +871,46 @@ export const getPublicCafeService = async (id: string) => {
     throw new BadRequestError("Invalid cafe ID");
   }
 
-  const cafe = await Cafe.findOne({
-    _id: id,
-    isApproved: true,
-    approvalStatus: "approved",
-    isVisible: true,
-    isActive: true,
-  }).select(
-    [
-      "name",
-      "description",
-      "logo",
-      "coverImage",
-      "galleryImages",
-      "city",
-      "state",
-      "address",
-      "landmark",
-      "pincode",
-      "rating",
-      "isOpen",
-      "deliveryEnabled",
-      "pickupEnabled",
-      "deliveryFee",
-      "platformFee",
-    ].join(" "),
+  return getOrLoadCachedJson(
+    redisKeys.publicCafe(id),
+    REDIS_TTLS.PUBLIC_CAFE_CACHE_SEC,
+    async () => {
+      const cafe = await Cafe.findOne({
+        _id: id,
+        isApproved: true,
+        approvalStatus: "approved",
+        isVisible: true,
+        isActive: true,
+      })
+        .select(
+          [
+            "name",
+            "description",
+            "logo",
+            "coverImage",
+            "galleryImages",
+            "city",
+            "state",
+            "address",
+            "landmark",
+            "pincode",
+            "rating",
+            "isOpen",
+            "deliveryEnabled",
+            "pickupEnabled",
+            "deliveryFee",
+            "platformFee",
+          ].join(" "),
+        )
+        .lean();
+
+      if (!cafe) {
+        throw new NotFoundError("Cafe not found");
+      }
+
+      return cafe;
+    },
   );
-
-  if (!cafe) {
-    throw new NotFoundError("Cafe not found");
-  }
-
-  return cafe;
 };
 
 /* =====================================================
@@ -589,9 +921,12 @@ const sign = (file?: IFile): IFile | undefined => {
     return file;
   }
 
+  const extMatch = file.url?.match(/\.([a-zA-Z0-9]{2,5})(?:[?#]|$)/);
+  const format = extMatch?.[1]?.toLowerCase() ?? "";
+
   return {
     ...file,
-    url: signedUrl(file.publicId),
+    url: signedUrl(file.publicId, undefined, format),
   };
 };
 
@@ -807,7 +1142,7 @@ export const approveCafeService = async (id: string) => {
       new: true,
       runValidators: true,
     },
-  ).select("name approvalStatus code");
+  ).select("name approvalStatus code owner");
 
   if (!cafe) {
     const exists = await Cafe.exists({
@@ -821,7 +1156,32 @@ export const approveCafeService = async (id: string) => {
     throw new ConflictError("Only pending cafes can be approved");
   }
 
-  return cafe;
+  await invalidatePublicCafeCaches(String(cafe._id));
+
+  if (cafe.owner) {
+    emitCafeApprovalEvent(
+      {
+        cafeId: String(cafe._id),
+        name: cafe.name,
+        approvalStatus: "approved",
+        isApproved: true,
+      },
+      String(cafe.owner),
+    );
+  }
+
+  logger.info("Cafe approved by admin", {
+    cafeId: String(cafe._id),
+    code: cafe.code,
+    operation: "CAFE_APPROVE",
+  });
+
+  return {
+    _id: cafe._id,
+    name: cafe.name,
+    approvalStatus: cafe.approvalStatus,
+    code: cafe.code,
+  };
 };
 
 /* =====================================================
@@ -832,8 +1192,12 @@ export const rejectCafeService = async (id: string, reason: string) => {
     throw new BadRequestError("Invalid cafe ID");
   }
 
-  if (!reason?.trim()) {
+  const trimmedReason = reason?.trim() ?? "";
+  if (!trimmedReason) {
     throw new BadRequestError("Rejection reason is required");
+  }
+  if (trimmedReason.length > 500) {
+    throw new BadRequestError("Rejection reason cannot exceed 500 characters");
   }
 
   const cafe = await Cafe.findOneAndUpdate(
@@ -844,7 +1208,7 @@ export const rejectCafeService = async (id: string, reason: string) => {
     {
       $set: {
         approvalStatus: "rejected",
-        rejectionReason: reason.trim(),
+        rejectionReason: trimmedReason,
         isApproved: false,
         isVisible: false,
         isOpen: false,
@@ -854,7 +1218,7 @@ export const rejectCafeService = async (id: string, reason: string) => {
       new: true,
       runValidators: true,
     },
-  ).select("name approvalStatus rejectionReason");
+  ).select("name approvalStatus rejectionReason owner");
 
   if (!cafe) {
     const exists = await Cafe.exists({
@@ -868,7 +1232,32 @@ export const rejectCafeService = async (id: string, reason: string) => {
     throw new ConflictError("Only pending cafes can be rejected");
   }
 
-  return cafe;
+  await invalidatePublicCafeCaches(String(cafe._id));
+
+  if (cafe.owner) {
+    emitCafeApprovalEvent(
+      {
+        cafeId: String(cafe._id),
+        name: cafe.name,
+        approvalStatus: "rejected",
+        isApproved: false,
+        rejectionReason: cafe.rejectionReason,
+      },
+      String(cafe.owner),
+    );
+  }
+
+  logger.info("Cafe rejected by admin", {
+    cafeId: String(cafe._id),
+    operation: "CAFE_REJECT",
+  });
+
+  return {
+    _id: cafe._id,
+    name: cafe.name,
+    approvalStatus: cafe.approvalStatus,
+    rejectionReason: cafe.rejectionReason,
+  };
 };
 
 /* =====================================================
@@ -880,40 +1269,52 @@ export const getPublicMenuService = async (
 ) => {
   assertObjectId(cafeId, "cafe ID");
 
-  const cafe = await Cafe.findOne({
-    _id: cafeId,
-    isApproved: true,
-    approvalStatus: "approved",
-    isVisible: true,
-    isActive: true,
-  }).select("name isOpen");
+  return getOrLoadCachedJson(
+    redisKeys.publicMenu(cafeId, onlyOrderable),
+    REDIS_TTLS.PUBLIC_MENU_CACHE_SEC,
+    async () => {
+      const cafe = await Cafe.findOne({
+        _id: cafeId,
+        isApproved: true,
+        approvalStatus: "approved",
+        isVisible: true,
+        isActive: true,
+      })
+        .select("name isOpen")
+        .lean();
 
-  if (!cafe) throw new NotFoundError("Cafe not found");
+      if (!cafe) throw new NotFoundError("Cafe not found");
 
-  const filter: Record<string, unknown> = { cafe: cafeId, isAvailable: true };
-  if (onlyOrderable) Object.assign(filter, ORDERABLE);
+      const filter: Record<string, unknown> = {
+        cafe: cafeId,
+        isAvailable: true,
+      };
+      if (onlyOrderable) Object.assign(filter, ORDERABLE);
 
-  const items = await MenuItem.find(filter)
-    .select(
-      "name description price category image isVeg isAvailable trackStock stock",
-    )
-    .sort({ category: 1, name: 1 })
-    .lean();
+      const items = await MenuItem.find(filter)
+        .select(
+          "name description price category image isVeg isAvailable trackStock stock",
+        )
+        .sort({ category: 1, name: 1 })
+        .limit(500)
+        .lean();
 
-  const grouped: Record<string, unknown[]> = {};
+      const grouped: Record<string, unknown[]> = {};
 
-  for (const raw of items) {
-    const { stock, trackStock, ...rest } = withStatus(raw);
-    (grouped[raw.category] ??= []).push({ ...rest, trackStock: undefined });
-    void stock;
-    void trackStock;
-  }
+      for (const raw of items) {
+        const { stock, trackStock, ...rest } = withStatus(raw);
+        (grouped[raw.category] ??= []).push({ ...rest, trackStock: undefined });
+        void stock;
+        void trackStock;
+      }
 
-  return {
-    cafe: { _id: cafe._id, name: cafe.name, isOpen: cafe.isOpen },
-    menu: Object.entries(grouped).map(([category, items]) => ({
-      category,
-      items,
-    })),
-  };
+      return {
+        cafe: { _id: cafe._id, name: cafe.name, isOpen: cafe.isOpen },
+        menu: Object.entries(grouped).map(([category, items]) => ({
+          category,
+          items,
+        })),
+      };
+    },
+  );
 };

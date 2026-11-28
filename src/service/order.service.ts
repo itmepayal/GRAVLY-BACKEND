@@ -1,17 +1,52 @@
 import { randomBytes } from "crypto";
-import { HydratedDocument, Types } from "mongoose";
+import { ClientSession, HydratedDocument, Types } from "mongoose";
 
 import { Cart } from "../models/cart.model.js";
 import { Cafe } from "../models/cafe.model.js";
 import { MenuItem, IMenuItem } from "../models/menuItem.model.js";
 import { Order, IOrder, OrderStatus } from "../models/order.model.js";
 import { Payment } from "../models/payment.model.js";
-import { refundOrderPayment, recordCashPayment } from "./payment.service.js";
+import { runWithOptionalTransaction } from "../config/db.config.js";
+import {
+  refundOrderPayment,
+  recordCashPayment,
+  emitPaymentLifecycleEvent,
+  syncLatestPayment,
+} from "./payment.service.js";
 import {
   BadRequestError,
   ConflictError,
   NotFoundError,
 } from "../utils/errors/app.error.js";
+import logger from "../config/logger.config.js";
+import { emitOrderEvent } from "../socket/index.js";
+import {
+  getOrderableCafeMeta,
+  invalidatePublicMenuCaches,
+  type OrderableCafeMeta,
+} from "./cafe.service.js";
+
+const extractObjectIdString = (val: unknown): string => {
+  if (val && typeof val === "object" && "_id" in val) {
+    return String((val as { _id: Types.ObjectId })._id);
+  }
+  return String(val);
+};
+
+const emitOrderLifecycleEvent = (order: HydratedDocument<IOrder>): void => {
+  emitOrderEvent({
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    cafeId: extractObjectIdString(order.cafe),
+    studentId: extractObjectIdString(order.student),
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    paymentMethod: order.paymentMethod,
+    totalAmount: order.totalAmount,
+    rejectionReason: order.rejectionReason ?? null,
+    updatedAt: order.updatedAt?.toISOString(),
+  });
+};
 
 /* =====================================================
    TYPES + CONSTANTS
@@ -34,8 +69,6 @@ const ACTIVE_STATUSES: OrderStatus[] = [
 const HISTORY_STATUSES: OrderStatus[] = ["delivered", "cancelled", "rejected"];
 const ALL_STATUSES: OrderStatus[] = [...ACTIVE_STATUSES, ...HISTORY_STATUSES];
 
-/* "ready" is allowed from confirmed too, because the app shows
-   "Preparing" right after accept and offers "Mark as Ready" */
 const PREVIOUS_STATUS: Record<StatusTarget, OrderStatus[]> = {
   preparing: ["confirmed"],
   ready: ["confirmed", "preparing"],
@@ -48,8 +81,7 @@ const VISIBLE_TO_CAFE = {
 
 const PHONE = /^[6-9]\d{9}$/;
 
-/* flat platform fee added to every order (in rupees) */
-const PLATFORM_FEE = 10;
+const roundMoney = (v: number): number => Math.round(v * 100) / 100;
 
 /* =====================================================
    HELPERS
@@ -93,6 +125,7 @@ const pagination = (page: number, limit: number, total: number) => ({
 
 export const releaseStock = async (
   items: { menuItem: Types.ObjectId | IMenuItem; quantity: number }[],
+  txSession?: ClientSession,
 ) => {
   if (items.length === 0) return;
   await MenuItem.bulkWrite(
@@ -102,12 +135,15 @@ export const releaseStock = async (
         update: { $inc: { stock: i.quantity } },
       },
     })),
+    txSession ? { session: txSession } : undefined,
   );
 };
 
 const safeRelease = (items: Parameters<typeof releaseStock>[0]) =>
   releaseStock(items).catch((e) =>
-    console.error("[order] stock release failed", e),
+    logger.error("[order] stock release failed", {
+      error: e instanceof Error ? e.message : String(e),
+    }),
   );
 
 const refundIfPaid = async (order: OrderDoc) => {
@@ -118,13 +154,16 @@ const refundIfPaid = async (order: OrderDoc) => {
     const refunded = await refundOrderPayment(order._id);
     if (refunded) order.paymentStatus = "refunded";
   } catch (e) {
-    console.error("[order] refund failed", order._id, e);
+    logger.error("[order] refund failed", {
+      orderId: String(order._id),
+      error: e instanceof Error ? e.message : String(e),
+    });
   }
 };
 
 const failTransition = async (
   orderId: string,
-  owner: Record<string, Types.ObjectId>,
+  owner: Record<string, unknown>,
   message: string,
 ): Promise<never> => {
   const exists = await Order.exists({ _id: oid(orderId), ...owner });
@@ -133,18 +172,39 @@ const failTransition = async (
     : new NotFoundError("Order not found");
 };
 
-const findOrderableCafe = async (cafeId: Types.ObjectId | string) => {
-  const cafe = await Cafe.findOne({
-    _id: cafeId,
-    isApproved: true,
-    approvalStatus: "approved",
-    isVisible: true,
-    isActive: true,
-  }).select(
-    "name isOpen deliveryEnabled pickupEnabled deliveryFee platformFee",
-  );
+const studentOwnerFilter = (studentId: string, legacyUserId?: string) =>
+  legacyUserId && legacyUserId !== studentId
+    ? { $in: [oid(studentId), oid(legacyUserId)] }
+    : oid(studentId);
 
-  if (!cafe) throw new NotFoundError("Cafe is not available");
+const STUDENT_POPULATE = {
+  path: "student",
+  select: "user rollNumber",
+  populate: {
+    path: "user",
+    select: "name",
+  },
+};
+
+const findOrderableCafe = async (
+  cafeId: Types.ObjectId | string,
+  txSession?: ClientSession,
+): Promise<OrderableCafeMeta> => {
+  const cafe = await Cafe.findById(
+    cafeId,
+    "name isOpen isApproved approvalStatus isVisible isActive deliveryEnabled pickupEnabled deliveryFee platformFee",
+    txSession ? { session: txSession } : undefined,
+  ).lean<OrderableCafeMeta | null>();
+
+  if (
+    !cafe ||
+    !cafe.isApproved ||
+    cafe.approvalStatus !== "approved" ||
+    !cafe.isVisible ||
+    !cafe.isActive
+  ) {
+    throw new NotFoundError("Cafe is not available");
+  }
   if (!cafe.isOpen) throw new ConflictError("Cafe is currently closed");
   return cafe;
 };
@@ -152,24 +212,52 @@ const findOrderableCafe = async (cafeId: Types.ObjectId | string) => {
 /* =====================================================
    VIEW 
 ===================================================== */
-const orderView = (o: OrderDoc) => {
-  const cafeRef = o.cafe as unknown as { _id?: Types.ObjectId; name?: string };
+type OrderViewInput = Pick<
+  IOrder,
+  | "orderNumber"
+  | "cafe"
+  | "student"
+  | "orderMethod"
+  | "deliveryAddress"
+  | "notes"
+  | "items"
+  | "subtotal"
+  | "deliveryFee"
+  | "platformFee"
+  | "totalAmount"
+  | "status"
+  | "paymentMethod"
+  | "paymentStatus"
+  | "rejectionReason"
+  | "completedAt"
+  | "createdAt"
+  | "updatedAt"
+> & { _id: Types.ObjectId };
+
+const orderView = (
+  o: OrderViewInput,
+  cafeOverride?: { _id: Types.ObjectId | string; name?: string | null },
+) => {
+  const cafeRef =
+    cafeOverride ??
+    (o.cafe as unknown as { _id?: Types.ObjectId; name?: string });
   const studentRef = o.student as unknown as {
     _id?: Types.ObjectId;
     name?: string;
-  };
+    user?: { _id?: Types.ObjectId; name?: string };
+  } | null;
 
   return {
     _id: o._id,
     orderNumber: o.orderNumber,
     status: o.status,
     cafe: {
-      _id: cafeRef._id ?? (o.cafe as Types.ObjectId),
-      name: cafeRef.name ?? null,
+      _id: cafeRef?._id ?? (o.cafe as Types.ObjectId),
+      name: cafeRef?.name ?? null,
     },
     student: {
-      _id: studentRef._id ?? (o.student as Types.ObjectId),
-      name: studentRef.name ?? null,
+      _id: studentRef?._id ?? (o.student as Types.ObjectId),
+      name: studentRef?.user?.name ?? studentRef?.name ?? null,
     },
     orderMethod: o.orderMethod,
     deliveryAddress:
@@ -200,136 +288,214 @@ const orderView = (o: OrderDoc) => {
 /* =====================================================
    STUDENT: PLACE ORDER
 ===================================================== */
-export const placeOrderService = async (studentId: string) => {
-  assertObjectId(studentId, "user ID");
+export const placeOrderService = async (
+  studentId: string,
+  legacyUserId?: string,
+) => {
+  assertObjectId(studentId, "student ID");
 
-  const cart = await Cart.findOne({
-    student: oid(studentId),
-    status: "active",
-  });
-  if (!cart || cart.items.length === 0) {
-    throw new BadRequestError("Your cart is empty");
-  }
+  const { order, reservedCount, cafe } = await runWithOptionalTransaction(
+    async (txSession) => {
+      const sessionOpt = txSession ? { session: txSession } : {};
 
-  const cafe = await findOrderableCafe(cart.cafe as Types.ObjectId);
-
-  if (cart.orderMethod === "delivery") {
-    if (!cafe.deliveryEnabled) {
-      throw new ConflictError("This cafe does not offer delivery");
-    }
-    const a = cart.deliveryAddress;
-    if (!a?.hostel || !a?.roomNumber || !a?.phone) {
-      throw new BadRequestError(
-        "Delivery needs deliveryAddress with hostel, roomNumber and phone",
-      );
-    }
-    if (!PHONE.test(a.phone)) {
-      throw new BadRequestError("Valid 10 digit phone is required");
-    }
-  } else if (!cafe.pickupEnabled) {
-    throw new ConflictError("This cafe does not offer self pickup");
-  }
-
-  const menu = await MenuItem.find({
-    _id: { $in: cart.items.map((i) => i.menuItem as Types.ObjectId) },
-  })
-    .select("name price isAvailable trackStock stock")
-    .lean<MenuLean[]>();
-
-  const byId = new Map<string, MenuLean>(menu.map((m) => [String(m._id), m]));
-  const problems: string[] = [];
-
-  const orderItems = cart.items.flatMap((line) => {
-    const m = byId.get(String(line.menuItem));
-    const name = m?.name ?? line.name ?? "Item";
-
-    if (!m || !m.isAvailable) {
-      problems.push(`${name}: No longer available`);
-      return [];
-    }
-    if (m.trackStock && m.stock < line.quantity) {
-      problems.push(
-        `${name}: ${m.stock === 0 ? "Out of stock" : `Only ${m.stock} left`}`,
-      );
-      return [];
-    }
-    return [
-      {
-        menuItem: m._id,
-        name: m.name,
-        quantity: line.quantity,
-        price: m.price,
-      },
-    ];
-  });
-
-  if (problems.length > 0) {
-    throw new ConflictError(`Cannot place order. ${problems.join(", ")}`);
-  }
-
-  const subtotal = orderItems.reduce((s, i) => s + i.price * i.quantity, 0);
-  const deliveryFee =
-    cart.orderMethod === "delivery" ? (cafe.deliveryFee ?? 0) : 0;
-  const platformFee = PLATFORM_FEE;
-  const totalAmount = subtotal + deliveryFee + platformFee;
-
-  const claimed = await Cart.findOneAndUpdate(
-    { _id: cart._id, status: "active" },
-    { $set: { status: "ordered" } },
-  );
-  if (!claimed) throw new ConflictError("This cart was already ordered");
-
-  const reserved: typeof orderItems = [];
-  try {
-    for (const item of orderItems) {
-      if (!byId.get(String(item.menuItem))?.trackStock) continue;
-
-      const r = await MenuItem.updateOne(
+      const cart = await Cart.findOne(
         {
-          _id: item.menuItem,
-          trackStock: true,
-          stock: { $gte: item.quantity },
+          student: studentOwnerFilter(studentId, legacyUserId),
+          status: "active",
         },
-        { $inc: { stock: -item.quantity } },
+        undefined,
+        sessionOpt,
       );
-      if (r.modifiedCount !== 1) {
-        throw new ConflictError(`${item.name}: not enough stock`);
+      if (!cart || cart.items.length === 0) {
+        throw new BadRequestError("Your cart is empty");
       }
-      reserved.push(item);
-    }
 
-    const order = await Order.create({
-      orderNumber: makeOrderNumber(),
-      student: oid(studentId),
-      cafe: cafe._id,
-      items: orderItems,
-      orderMethod: cart.orderMethod,
-      deliveryAddress:
-        cart.orderMethod === "delivery" ? cart.deliveryAddress : undefined,
-      notes: cart.orderNotes,
-      subtotal,
-      deliveryFee,
-      platformFee,
-      totalAmount,
-      status: "pending",
-      paymentMethod: cart.paymentMethod,
-      paymentStatus: "pending",
-    });
+      const liveCafe = await findOrderableCafe(
+        cart.cafe as Types.ObjectId,
+        txSession,
+      );
 
-    await order.populate("cafe", "name");
-    return orderView(order);
-  } catch (err) {
-    await safeRelease(reserved);
-    await Cart.updateOne({ _id: cart._id }, { $set: { status: "active" } });
-    throw err;
+      if (cart.orderMethod === "delivery") {
+        if (!liveCafe.deliveryEnabled) {
+          throw new ConflictError("This cafe does not offer delivery");
+        }
+        const a = cart.deliveryAddress;
+        if (!a?.hostel || !a?.roomNumber || !a?.phone) {
+          throw new BadRequestError(
+            "Delivery needs deliveryAddress with hostel, roomNumber and phone",
+          );
+        }
+        if (!PHONE.test(a.phone)) {
+          throw new BadRequestError("Valid 10 digit phone is required");
+        }
+      } else if (!liveCafe.pickupEnabled) {
+        throw new ConflictError("This cafe does not offer self pickup");
+      }
+
+      const menu = await MenuItem.find(
+        { _id: { $in: cart.items.map((i) => i.menuItem as Types.ObjectId) } },
+        "name price isAvailable trackStock stock",
+        sessionOpt,
+      ).lean<MenuLean[]>();
+
+      const byId = new Map<string, MenuLean>(
+        menu.map((m) => [String(m._id), m]),
+      );
+      const problems: string[] = [];
+
+      const orderItems = cart.items.flatMap((line) => {
+        const m = byId.get(String(line.menuItem));
+        const name = m?.name ?? line.name ?? "Item";
+
+        if (!m || !m.isAvailable) {
+          problems.push(`${name}: No longer available`);
+          return [];
+        }
+        if (m.trackStock && m.stock < line.quantity) {
+          problems.push(
+            `${name}: ${m.stock === 0 ? "Out of stock" : `Only ${m.stock} left`}`,
+          );
+          return [];
+        }
+        return [
+          {
+            menuItem: m._id,
+            name: m.name,
+            quantity: line.quantity,
+            price: roundMoney(m.price),
+          },
+        ];
+      });
+
+      if (problems.length > 0) {
+        throw new ConflictError(`Cannot place order. ${problems.join(", ")}`);
+      }
+
+      const subtotal = roundMoney(
+        orderItems.reduce((s, i) => s + i.price * i.quantity, 0),
+      );
+      const deliveryFee =
+        cart.orderMethod === "delivery"
+          ? roundMoney(Math.max(0, Number(liveCafe.deliveryFee ?? 0)))
+          : 0;
+      const platformFee = roundMoney(
+        Math.max(0, Number(liveCafe.platformFee ?? 0)),
+      );
+      const totalAmount = roundMoney(subtotal + deliveryFee + platformFee);
+
+      const claimed = await Cart.findOneAndUpdate(
+        { _id: cart._id, status: "active" },
+        { $set: { status: "ordered" } },
+        sessionOpt,
+      );
+      if (!claimed) throw new ConflictError("This cart was already ordered");
+
+      const reserved: typeof orderItems = [];
+      const sortedReserveItems = [...orderItems].sort((a, b) =>
+        String(a.menuItem).localeCompare(String(b.menuItem)),
+      );
+      try {
+        for (const item of sortedReserveItems) {
+          const liveItem = byId.get(String(item.menuItem));
+          if (!liveItem?.trackStock) continue;
+
+          const r = await MenuItem.updateOne(
+            {
+              _id: item.menuItem,
+              trackStock: true,
+              isAvailable: true,
+              price: liveItem.price,
+              stock: { $gte: item.quantity },
+            },
+            { $inc: { stock: -item.quantity } },
+            sessionOpt,
+          );
+          if (r.modifiedCount !== 1) {
+            logger.warn("[order] Inventory reservation conflict", {
+              studentId,
+              cafeId: String(liveCafe._id),
+              menuItemId: String(item.menuItem),
+              quantity: item.quantity,
+              operation: "ORDER_INVENTORY_CONFLICT",
+            });
+            throw new ConflictError(
+              `${item.name}: item availability or stock changed during checkout`,
+            );
+          }
+          reserved.push(item);
+        }
+
+        const orderDoc = {
+          orderNumber: makeOrderNumber(),
+          student: oid(studentId),
+          cafe: new Types.ObjectId(String(liveCafe._id)),
+          items: orderItems,
+          orderMethod: cart.orderMethod,
+          deliveryAddress:
+            cart.orderMethod === "delivery" ? cart.deliveryAddress : undefined,
+          notes: cart.orderNotes,
+          subtotal,
+          deliveryFee,
+          platformFee,
+          totalAmount,
+          status: "pending" as const,
+          paymentMethod: cart.paymentMethod,
+          paymentStatus: "pending" as const,
+          stockReleased: false,
+        };
+
+        const created = txSession
+          ? (await Order.create([orderDoc], { session: txSession }))[0]
+          : await Order.create(orderDoc);
+
+        return { order: created, reservedCount: reserved.length, cafe: liveCafe };
+      } catch (err) {
+        if (!txSession) {
+          await safeRelease(reserved);
+          await Cart.updateOne(
+            { _id: cart._id, status: "ordered" },
+            { $set: { status: "active" } },
+          ).catch((restoreErr) =>
+            logger.error("[order] cart rollback failed", {
+              cartId: String(cart._id),
+              error:
+                restoreErr instanceof Error
+                  ? restoreErr.message
+                  : String(restoreErr),
+            }),
+          );
+        }
+        throw err;
+      }
+    },
+  );
+
+  if (reservedCount > 0) {
+    await invalidatePublicMenuCaches(String(cafe._id));
   }
+  logger.info("Order created successfully", {
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    cafeId: String(cafe._id),
+    studentId,
+    paymentMethod: order.paymentMethod,
+    totalAmount: order.totalAmount,
+    reservedCount,
+    operation: "CREATE_ORDER",
+  });
+  emitOrderLifecycleEvent(order);
+  return orderView(order, { _id: cafe._id, name: cafe.name });
 };
 
 /* =====================================================
    STUDENT: MY ORDERS
 ===================================================== */
-export const getMyOrdersService = async (studentId: string, query: unknown) => {
-  assertObjectId(studentId, "user ID");
+export const getMyOrdersService = async (
+  studentId: string,
+  query: unknown,
+  legacyUserId?: string,
+) => {
+  assertObjectId(studentId, "student ID");
 
   const q = asObject(query);
   const type = str(q.type) || "active";
@@ -339,21 +505,36 @@ export const getMyOrdersService = async (studentId: string, query: unknown) => {
 
   const { page, limit, skip } = parsePaging(q);
   const filter = {
-    student: oid(studentId),
+    student: studentOwnerFilter(studentId, legacyUserId),
     status: { $in: type === "active" ? ACTIVE_STATUSES : HISTORY_STATUSES },
   };
 
-  const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate("cafe", "name"),
-    Order.countDocuments(filter),
-  ]);
+  const orders = await Order.find(filter)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .lean<OrderViewInput[]>();
+
+  const uniqueCafeIds = Array.from(new Set(orders.map((o) => String(o.cafe))));
+  const cafeMetaList = await Promise.all(
+    uniqueCafeIds.map((id) => getOrderableCafeMeta(id)),
+  );
+  const cafeMap = new Map(
+    uniqueCafeIds.map((id, idx) => [
+      id,
+      cafeMetaList[idx]
+        ? { _id: cafeMetaList[idx]!._id, name: cafeMetaList[idx]!.name }
+        : { _id: id, name: null },
+    ]),
+  );
+
+  const total =
+    skip === 0 && orders.length < limit
+      ? orders.length
+      : await Order.countDocuments(filter);
 
   return {
-    orders: orders.map(orderView),
+    orders: orders.map((o) => orderView(o, cafeMap.get(String(o.cafe)))),
     pagination: pagination(page, limit, total),
   };
 };
@@ -361,17 +542,25 @@ export const getMyOrdersService = async (studentId: string, query: unknown) => {
 /* =====================================================
    STUDENT: ORDER DETAILS
 ===================================================== */
-export const getMyOrderService = async (studentId: string, orderId: string) => {
-  assertObjectId(studentId, "user ID");
+export const getMyOrderService = async (
+  studentId: string,
+  orderId: string,
+  legacyUserId?: string,
+) => {
+  assertObjectId(studentId, "student ID");
   assertObjectId(orderId, "order ID");
 
   const order = await Order.findOne({
     _id: oid(orderId),
-    student: oid(studentId),
-  }).populate("cafe", "name");
+    student: studentOwnerFilter(studentId, legacyUserId),
+  }).lean<OrderViewInput | null>();
 
   if (!order) throw new NotFoundError("Order not found");
-  return orderView(order);
+  const cafeMeta = await getOrderableCafeMeta(String(order.cafe));
+  return orderView(
+    order,
+    cafeMeta ? { _id: cafeMeta._id, name: cafeMeta.name } : undefined,
+  );
 };
 
 /* =====================================================
@@ -380,43 +569,112 @@ export const getMyOrderService = async (studentId: string, orderId: string) => {
 export const cancelMyOrderService = async (
   studentId: string,
   orderId: string,
+  legacyUserId?: string,
 ) => {
-  assertObjectId(studentId, "user ID");
+  assertObjectId(studentId, "student ID");
   assertObjectId(orderId, "order ID");
 
-  const order = await Order.findOneAndUpdate(
-    { _id: oid(orderId), student: oid(studentId), status: "pending" },
-    { $set: { status: "cancelled", completedAt: new Date() } },
-    { new: true },
-  ).populate("cafe", "name");
+  const ownerFilter = studentOwnerFilter(studentId, legacyUserId);
+
+  const order = await runWithOptionalTransaction(async (txSession) => {
+    const sessionOpt = txSession ? { session: txSession } : {};
+    const doc = await Order.findOneAndUpdate(
+      {
+        _id: oid(orderId),
+        student: ownerFilter,
+        status: "pending",
+        stockReleased: { $ne: true },
+      },
+      {
+        $set: {
+          status: "cancelled",
+          completedAt: new Date(),
+          stockReleased: true,
+        },
+      },
+      { new: true, ...sessionOpt },
+    ).populate("cafe", "name");
+
+    if (!doc) return null;
+
+    try {
+      await releaseStock(doc.items, txSession);
+    } catch (releaseErr) {
+      if (!txSession) {
+        await Order.updateOne(
+          { _id: doc._id, status: "cancelled" },
+          {
+            $set: { status: "pending", stockReleased: false },
+            $unset: { completedAt: "" },
+          },
+        ).catch(() => {});
+      }
+      throw releaseErr;
+    }
+
+    return doc;
+  });
 
   if (!order) {
     return failTransition(
       orderId,
-      { student: oid(studentId) },
+      { student: ownerFilter },
       "Order can only be cancelled before the cafe accepts it",
     );
   }
 
-  await safeRelease(order.items);
+  await invalidatePublicMenuCaches(extractObjectIdString(order.cafe));
 
   if (order.paymentMethod === "online" && order.paymentStatus === "pending") {
+    let gatewaySynced = false;
     try {
-      await Order.updateOne(
-        { _id: order._id, paymentStatus: "pending" },
-        { $set: { paymentStatus: "failed" } },
-      );
-      await Payment.updateMany(
-        { order: order._id, status: "pending" },
-        { $set: { status: "failed" } },
-      );
-      order.paymentStatus = "failed";
+      await syncLatestPayment(order._id);
+      gatewaySynced = true;
     } catch (e) {
-      console.error("[order] closing pending payment failed", order._id, e);
+      logger.error("[order] syncing payment before cancel cleanup failed", {
+        orderId: String(order._id),
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    const refreshed = await Order.findById(order._id)
+      .select("paymentStatus paymentId")
+      .lean();
+    if (refreshed) {
+      order.paymentStatus = refreshed.paymentStatus;
+      order.paymentId = refreshed.paymentId;
+    }
+
+    if (gatewaySynced && order.paymentStatus === "pending") {
+      try {
+        await Order.updateOne(
+          { _id: order._id, paymentStatus: "pending" },
+          { $set: { paymentStatus: "failed" } },
+        );
+        await Payment.updateMany(
+          { order: order._id, status: "pending" },
+          { $set: { status: "failed" } },
+        );
+        order.paymentStatus = "failed";
+      } catch (e) {
+        logger.error("[order] closing pending payment failed", {
+          orderId: String(order._id),
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   }
 
   await refundIfPaid(order);
+
+  logger.info("Order cancelled by student", {
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    studentId,
+    cafeId: extractObjectIdString(order.cafe),
+    operation: "CANCEL_ORDER",
+  });
+  emitOrderLifecycleEvent(order);
 
   return orderView(order);
 };
@@ -449,18 +707,21 @@ export const getCafeOrdersService = async (cafeId: string, query: unknown) => {
     status: statusFilter,
   };
 
-  const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate("cafe", "name")
-      .populate("student", "name"),
-    Order.countDocuments(filter),
-  ]);
+  const orders = await Order.find(filter)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .populate("cafe", "name")
+    .populate(STUDENT_POPULATE)
+    .lean<OrderViewInput[]>();
+
+  const total =
+    skip === 0 && orders.length < limit
+      ? orders.length
+      : await Order.countDocuments(filter);
 
   return {
-    orders: orders.map(orderView),
+    orders: orders.map((o) => orderView(o)),
     pagination: pagination(page, limit, total),
   };
 };
@@ -478,7 +739,8 @@ export const getCafeOrderService = async (cafeId: string, orderId: string) => {
     ...VISIBLE_TO_CAFE,
   })
     .populate("cafe", "name")
-    .populate("student", "name");
+    .populate(STUDENT_POPULATE)
+    .lean<OrderViewInput | null>();
 
   if (!order) throw new NotFoundError("Order not found");
   return orderView(order);
@@ -502,7 +764,7 @@ export const acceptOrderService = async (cafeId: string, orderId: string) => {
     { new: true },
   )
     .populate("cafe", "name")
-    .populate("student", "name");
+    .populate(STUDENT_POPULATE);
 
   if (!order) {
     return failTransition(
@@ -511,6 +773,12 @@ export const acceptOrderService = async (cafeId: string, orderId: string) => {
       "Only pending (and paid, if online) orders can be accepted",
     );
   }
+  logger.info("Order accepted by cafe", {
+    orderId: String(order._id),
+    cafeId,
+    operation: "ACCEPT_ORDER",
+  });
+  emitOrderLifecycleEvent(order);
   return orderView(order);
 };
 
@@ -532,24 +800,48 @@ export const rejectOrderService = async (
   }
   const reason = given || "Rejected by the cafe";
 
-  const order = await Order.findOneAndUpdate(
-    {
-      _id: oid(orderId),
-      cafe: oid(cafeId),
-      status: "pending",
-      ...VISIBLE_TO_CAFE,
-    },
-    {
-      $set: {
-        status: "rejected",
-        rejectionReason: reason,
-        completedAt: new Date(),
+  const order = await runWithOptionalTransaction(async (txSession) => {
+    const sessionOpt = txSession ? { session: txSession } : {};
+    const doc = await Order.findOneAndUpdate(
+      {
+        _id: oid(orderId),
+        cafe: oid(cafeId),
+        status: "pending",
+        stockReleased: { $ne: true },
+        ...VISIBLE_TO_CAFE,
       },
-    },
-    { new: true },
-  )
-    .populate("cafe", "name")
-    .populate("student", "name");
+      {
+        $set: {
+          status: "rejected",
+          rejectionReason: reason,
+          completedAt: new Date(),
+          stockReleased: true,
+        },
+      },
+      { new: true, ...sessionOpt },
+    )
+      .populate("cafe", "name")
+      .populate(STUDENT_POPULATE);
+
+    if (!doc) return null;
+
+    try {
+      await releaseStock(doc.items, txSession);
+    } catch (releaseErr) {
+      if (!txSession) {
+        await Order.updateOne(
+          { _id: doc._id, status: "rejected" },
+          {
+            $set: { status: "pending", stockReleased: false },
+            $unset: { rejectionReason: "", completedAt: "" },
+          },
+        ).catch(() => {});
+      }
+      throw releaseErr;
+    }
+
+    return doc;
+  });
 
   if (!order) {
     return failTransition(
@@ -559,10 +851,16 @@ export const rejectOrderService = async (
     );
   }
 
-  await safeRelease(order.items);
+  await invalidatePublicMenuCaches(extractObjectIdString(order.cafe));
 
   await refundIfPaid(order);
 
+  logger.info("Order rejected by cafe", {
+    orderId: String(order._id),
+    cafeId,
+    operation: "REJECT_ORDER",
+  });
+  emitOrderLifecycleEvent(order);
   return orderView(order);
 };
 
@@ -582,22 +880,72 @@ export const updateOrderStatusService = async (
     throw new BadRequestError("status must be preparing, ready or delivered");
   }
 
-  const order = await Order.findOneAndUpdate(
-    {
-      _id: oid(orderId),
-      cafe: oid(cafeId),
-      status: { $in: PREVIOUS_STATUS[target] },
+  const { order, cashPaymentCreated } = await runWithOptionalTransaction(
+    async (txSession) => {
+      const sessionOpt = txSession ? { session: txSession } : {};
+      const doc = await Order.findOneAndUpdate(
+        {
+          _id: oid(orderId),
+          cafe: oid(cafeId),
+          status: { $in: PREVIOUS_STATUS[target] },
+          ...VISIBLE_TO_CAFE,
+        },
+        {
+          $set: {
+            status: target,
+            ...(target === "delivered" ? { completedAt: new Date() } : {}),
+          },
+        },
+        { new: true, ...sessionOpt },
+      )
+        .populate("cafe", "name")
+        .populate(STUDENT_POPULATE);
+
+      if (!doc) {
+        return { order: null, cashPaymentCreated: null };
+      }
+
+      let recordedCash: Awaited<ReturnType<typeof recordCashPayment>> | null =
+        null;
+      if (target === "delivered" && doc.paymentMethod === "cash") {
+        try {
+          recordedCash = await recordCashPayment(doc._id, {
+            txSession,
+            deferEmit: true,
+          });
+          await Order.updateOne(
+            { _id: doc._id },
+            {
+              $set: {
+                paymentStatus: "paid",
+                paymentId: recordedCash._id,
+              },
+            },
+            sessionOpt,
+          );
+          doc.paymentStatus = "paid";
+          doc.paymentId = recordedCash._id;
+        } catch (cashErr) {
+          if (!txSession) {
+            await Order.updateOne(
+              { _id: doc._id, status: "delivered" },
+              {
+                $set: { status: "ready", paymentStatus: "pending" },
+                $unset: { completedAt: "" },
+              },
+            ).catch(() => {});
+          }
+          logger.error("[order] cash payment persistence failed", {
+            orderId: String(doc._id),
+            error: cashErr instanceof Error ? cashErr.message : String(cashErr),
+          });
+          throw cashErr;
+        }
+      }
+
+      return { order: doc, cashPaymentCreated: recordedCash };
     },
-    {
-      $set: {
-        status: target,
-        ...(target === "delivered" ? { completedAt: new Date() } : {}),
-      },
-    },
-    { new: true },
-  )
-    .populate("cafe", "name")
-    .populate("student", "name");
+  );
 
   if (!order) {
     return failTransition(
@@ -607,17 +955,19 @@ export const updateOrderStatusService = async (
     );
   }
 
-  if (target === "delivered" && order.paymentMethod === "cash") {
-    order.paymentStatus = "paid";
-    await order.save();
-
-    try {
-      await recordCashPayment(order._id);
-    } catch (e) {
-      console.error("[order] cash payment record failed", order._id, e);
-    }
+  if (cashPaymentCreated) {
+    emitPaymentLifecycleEvent(cashPaymentCreated, "paid");
   }
 
+  logger.info("Order status updated", {
+    orderId: String(order._id),
+    cafeId,
+    status: target,
+    paymentStatus: order.paymentStatus,
+    cashPaymentLinked: Boolean(cashPaymentCreated),
+    operation: "UPDATE_ORDER_STATUS",
+  });
+  emitOrderLifecycleEvent(order);
   return orderView(order);
 };
 
@@ -674,7 +1024,7 @@ export const getCafeOrderSummaryService = async (cafeId: string) => {
 /* =====================================================
    CAFE: TRANSACTION HISTORY (delivered orders + earnings)
 ===================================================== */
-const transactionView = (o: OrderDoc) => {
+const transactionView = (o: OrderViewInput) => {
   const v = orderView(o);
   return {
     _id: v._id,
@@ -698,19 +1048,24 @@ export const getCafeOrderHistoryService = async (
   const { page, limit, skip } = parsePaging(asObject(query));
   const filter = { cafe: oid(cafeId), status: "delivered" as const };
 
-  const [orders, total, all] = await Promise.all([
+  const [orders, all] = await Promise.all([
     Order.find(filter)
       .sort({ completedAt: -1 })
       .skip(skip)
       .limit(limit)
       .populate("cafe", "name")
-      .populate("student", "name"),
-    Order.countDocuments(filter),
+      .populate(STUDENT_POPULATE)
+      .lean<OrderViewInput[]>(),
     Order.aggregate<{ earnings: number }>([
       { $match: filter },
       { $group: { _id: null, earnings: { $sum: EARNING } } },
     ]),
   ]);
+
+  const total =
+    skip === 0 && orders.length < limit
+      ? orders.length
+      : await Order.countDocuments(filter);
 
   return {
     totalEarnings: all[0]?.earnings ?? 0,

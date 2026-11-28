@@ -143,7 +143,7 @@ const cafeSchema = new Schema<ICafe>(
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      index: true,
+      unique: true,
     },
 
     code: {
@@ -425,8 +425,26 @@ cafeSchema.index({
 
 cafeSchema.index({
   isApproved: 1,
+  approvalStatus: 1,
   isVisible: 1,
   isActive: 1,
+  isOpen: -1,
+  "rating.average": -1,
+});
+
+cafeSchema.index({
+  isApproved: 1,
+  approvalStatus: 1,
+  isVisible: 1,
+  isActive: 1,
+  city: 1,
+  isOpen: -1,
+  "rating.average": -1,
+});
+
+cafeSchema.index({
+  approvalStatus: 1,
+  createdAt: -1,
 });
 
 export const Cafe = model<ICafe>("Cafe", cafeSchema);

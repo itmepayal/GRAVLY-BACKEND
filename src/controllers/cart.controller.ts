@@ -11,16 +11,11 @@ import {
 } from "../service/cart.service.js";
 
 import { BadRequestError } from "../utils/errors/app.error.js";
+import { studentIdentityOf } from "../utils/order/requestUser.js";
 
 /* =====================================================
    HELPERS
 ===================================================== */
-const getUserId = (req: Request): string => {
-  const id = req.user?._id;
-  if (!id) throw new BadRequestError("Authenticated user is missing");
-  return String(id);
-};
-
 const itemId = (req: Request): string => {
   const id = String(req.params.menuItemId ?? "");
   if (!Types.ObjectId.isValid(id))
@@ -38,7 +33,8 @@ export const getMyCart = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const data = await getMyCartService(getUserId(req));
+    const { studentId, userId } = await studentIdentityOf(req);
+    const data = await getMyCartService(studentId, userId);
     res
       .status(200)
       .json({ success: true, message: "Cart fetched successfully", data });
@@ -57,7 +53,8 @@ export const addToCart = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const data = await addToCartService(getUserId(req), req.body);
+    const { studentId, userId } = await studentIdentityOf(req);
+    const data = await addToCartService(studentId, req.body, userId);
     res
       .status(200)
       .json({ success: true, message: "Item added to cart", data });
@@ -76,10 +73,12 @@ export const updateCartItem = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
+    const { studentId, userId } = await studentIdentityOf(req);
     const data = await updateCartItemService(
-      getUserId(req),
+      studentId,
       itemId(req),
       req.body,
+      userId,
     );
     res.status(200).json({ success: true, message: "Cart updated", data });
   } catch (error) {
@@ -96,7 +95,8 @@ export const removeCartItem = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const data = await removeCartItemService(getUserId(req), itemId(req));
+    const { studentId, userId } = await studentIdentityOf(req);
+    const data = await removeCartItemService(studentId, itemId(req), userId);
     res
       .status(200)
       .json({ success: true, message: "Item removed from cart", data });
@@ -114,7 +114,8 @@ export const clearCart = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const data = await clearCartService(getUserId(req));
+    const { studentId, userId } = await studentIdentityOf(req);
+    const data = await clearCartService(studentId, userId);
     res.status(200).json({ success: true, message: "Cart cleared", data });
   } catch (error) {
     next(error);
@@ -132,7 +133,8 @@ export const updateCartOptions = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const data = await updateCartOptionsService(getUserId(req), req.body);
+    const { studentId, userId } = await studentIdentityOf(req);
+    const data = await updateCartOptionsService(studentId, req.body, userId);
     res
       .status(200)
       .json({ success: true, message: "Cart options updated", data });

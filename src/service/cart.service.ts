@@ -1,8 +1,13 @@
 import { HydratedDocument, Types } from "mongoose";
 
+import logger from "../config/logger.config.js";
 import { Cart, ICart } from "../models/cart.model.js";
-import { Cafe } from "../models/cafe.model.js";
 import { MenuItem, IMenuItem } from "../models/menuItem.model.js";
+import {
+  getOrderableCafeMeta,
+  type OrderableCafeMeta,
+} from "./cafe.service.js";
+import { emitCartEvent } from "../socket/index.js";
 import {
   BadRequestError,
   ConflictError,
@@ -30,6 +35,56 @@ type MenuLean = Pick<
    HELPERS
 ===================================================== */
 const MAX_QTY = 20;
+const MAX_CART_CONCURRENCY_RETRIES = 6;
+
+const isCartConcurrencyError = (err: unknown): boolean => {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: number }).code;
+  const name = (err as { name?: string }).name;
+  return code === 11000 || name === "VersionError";
+};
+
+const withCartConcurrencyRetry = async <T>(
+  work: () => Promise<T>,
+): Promise<T> => {
+  for (let attempt = 0; attempt <= MAX_CART_CONCURRENCY_RETRIES; attempt++) {
+    try {
+      return await work();
+    } catch (err) {
+      if (isCartConcurrencyError(err) && attempt < MAX_CART_CONCURRENCY_RETRIES) {
+        logger.warn("[cart] Concurrent update conflict; retrying", {
+          attempt: attempt + 1,
+          operation: "CART_CONCURRENCY_RETRY",
+        });
+        const delayMs = 8 + Math.floor(Math.random() * 20) * (attempt + 1);
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      if (isCartConcurrencyError(err)) {
+        logger.warn("[cart] Concurrent update conflict retries exhausted", {
+          attempts: attempt,
+          operation: "CART_CONCURRENCY_FAILED",
+        });
+        throw new ConflictError(
+          "Your cart is being updated concurrently. Please try again.",
+        );
+      }
+      throw err;
+    }
+  }
+  throw new ConflictError("Could not update cart due to concurrent edits");
+};
+
+const roundMoney = (v: number): number => Math.round(v * 100) / 100;
+
+const resolvePlatformFee = (
+  cafe?: Pick<OrderableCafeMeta, "platformFee"> | null,
+): number => roundMoney(Math.max(0, Number(cafe?.platformFee ?? 0)));
+
+const computeCartTotalAmount = (
+  items: ReadonlyArray<{ price: number; quantity: number }>,
+): number =>
+  roundMoney(items.reduce((sum, item) => sum + item.price * item.quantity, 0));
 
 const oid = (id: string) => new Types.ObjectId(id);
 
@@ -39,14 +94,18 @@ const assertObjectId = (id: string, label: string) => {
 };
 
 const toQuantity = (v: unknown, min: number): number => {
+  if (typeof v !== "number" && typeof v !== "string") {
+    throw new BadRequestError(
+      `quantity must be a whole number between ${min} and ${MAX_QTY}`,
+    );
+  }
+  if (typeof v === "string" && !v.trim()) {
+    throw new BadRequestError(
+      `quantity must be a whole number between ${min} and ${MAX_QTY}`,
+    );
+  }
   const n = Number(v);
-  if (
-    v === "" ||
-    v === null ||
-    !Number.isInteger(n) ||
-    n < min ||
-    n > MAX_QTY
-  ) {
+  if (!Number.isInteger(n) || n < min || n > MAX_QTY) {
     throw new BadRequestError(
       `quantity must be a whole number between ${min} and ${MAX_QTY}`,
     );
@@ -70,7 +129,7 @@ const asObject = (v: unknown): Record<string, unknown> =>
 const PHONE = /^[6-9]\d{9}$/;
 
 /* Returns the address only if at least one field is filled, else null */
-const addressView = (cart: CartDoc | null) => {
+const addressView = (cart: Pick<ICart, "deliveryAddress"> | null) => {
   const a = cart?.deliveryAddress;
   if (!a) return null;
   const address = {
@@ -90,32 +149,68 @@ const addressView = (cart: CartDoc | null) => {
 const findOrderableCafe = async (
   cafeId: Types.ObjectId | string,
   { requireOpen = false }: { requireOpen?: boolean } = {},
-) => {
-  const cafe = await Cafe.findOne({
-    _id: cafeId,
-    isApproved: true,
-    approvalStatus: "approved",
-    isVisible: true,
-    isActive: true,
-  }).select(
-    "name isOpen deliveryEnabled pickupEnabled deliveryFee platformFee",
-  );
+): Promise<OrderableCafeMeta> => {
+  const cafe = await getOrderableCafeMeta(cafeId);
 
-  if (!cafe) throw new NotFoundError("Cafe is not available");
+  if (
+    !cafe ||
+    !cafe.isApproved ||
+    cafe.approvalStatus !== "approved" ||
+    !cafe.isVisible ||
+    !cafe.isActive
+  ) {
+    throw new NotFoundError("Cafe is not available");
+  }
   if (requireOpen && !cafe.isOpen) {
     throw new ConflictError("Cafe is currently closed");
   }
   return cafe;
 };
 
-const findActiveCart = (studentId: string) =>
-  Cart.findOne({ student: oid(studentId), status: "active" });
+const studentIdsFilter = (studentId: string, legacyUserId?: string) =>
+  legacyUserId && legacyUserId !== studentId
+    ? { $in: [oid(studentId), oid(legacyUserId)] }
+    : oid(studentId);
+
+const findActiveCart = (studentId: string, legacyUserId?: string) =>
+  Cart.findOne({
+    student: studentIdsFilter(studentId, legacyUserId),
+    status: "active",
+  });
 
 /* =====================================================
    BUILD CART VIEW
 ===================================================== */
-const buildView = async (cart: CartDoc | null) => {
+type CartViewInput = Pick<
+  ICart,
+  | "cafe"
+  | "items"
+  | "orderMethod"
+  | "paymentMethod"
+  | "deliveryAddress"
+  | "orderNotes"
+  | "totalAmount"
+> & { _id: Types.ObjectId };
+
+const buildView = async (
+  cart: CartViewInput | null,
+  preloaded?: {
+    cafe?: OrderableCafeMeta | null;
+    menuById?: Map<string, MenuLean>;
+  },
+) => {
   if (!cart || cart.items.length === 0) {
+    if (cart && cart.totalAmount !== 0) {
+      if ("save" in cart && typeof (cart as CartDoc).save === "function") {
+        cart.totalAmount = 0;
+        await (cart as CartDoc).save();
+      } else {
+        await Cart.updateOne(
+          { _id: cart._id, items: { $size: 0 }, totalAmount: { $ne: 0 } },
+          { $set: { totalAmount: 0 } },
+        );
+      }
+    }
     return {
       _id: cart?._id ?? null,
       cafe: null,
@@ -136,18 +231,29 @@ const buildView = async (cart: CartDoc | null) => {
     };
   }
 
-  const [menu, cafe] = await Promise.all([
-    MenuItem.find({
-      _id: { $in: cart.items.map((i) => i.menuItem as Types.ObjectId) },
-    })
-      .select("name price image isAvailable trackStock stock isVeg")
-      .lean<MenuLean[]>(),
-    Cafe.findById(cart.cafe).select(
-      "name isOpen isVisible isActive deliveryEnabled pickupEnabled deliveryFee platformFee",
-    ),
+  const missingMenuIds = preloaded?.menuById
+    ? cart.items
+        .map((i) => i.menuItem as Types.ObjectId)
+        .filter((id) => !preloaded.menuById!.has(String(id)))
+    : cart.items.map((i) => i.menuItem as Types.ObjectId);
+
+  const [fetchedMenu, cafe] = await Promise.all([
+    missingMenuIds.length > 0
+      ? MenuItem.find({
+          _id: { $in: missingMenuIds },
+        })
+          .select("name price image isAvailable trackStock stock isVeg")
+          .lean<MenuLean[]>()
+      : Promise.resolve([] as MenuLean[]),
+    preloaded?.cafe !== undefined
+      ? Promise.resolve(preloaded.cafe)
+      : getOrderableCafeMeta(cart.cafe as Types.ObjectId),
   ]);
 
-  const byId = new Map<string, MenuLean>(menu.map((m) => [String(m._id), m]));
+  const byId = new Map<string, MenuLean>(preloaded?.menuById ?? []);
+  for (const m of fetchedMenu) {
+    byId.set(String(m._id), m);
+  }
   const issues: string[] = [];
   let subtotal = 0;
   let itemCount = 0;
@@ -187,27 +293,46 @@ const buildView = async (cart: CartDoc | null) => {
       isVeg: m?.isVeg ?? true,
       price,
       quantity: line.quantity,
-      lineTotal: price * line.quantity,
+      lineTotal: roundMoney(price * line.quantity),
       orderable,
       reason,
     };
   });
 
+  subtotal = roundMoney(subtotal);
+
   if (cart.totalAmount !== subtotal) {
     cart.totalAmount = subtotal;
     changed = true;
   }
-  if (changed) await cart.save();
+  if (changed) {
+    if ("save" in cart && typeof (cart as CartDoc).save === "function") {
+      await (cart as CartDoc).save();
+    } else {
+      await Cart.updateOne(
+        { _id: cart._id },
+        { $set: { items: cart.items, totalAmount: cart.totalAmount } },
+      );
+    }
+  }
 
-  if (!cafe || !cafe.isVisible || !cafe.isActive) {
+  if (
+    !cafe ||
+    !cafe.isApproved ||
+    cafe.approvalStatus !== "approved" ||
+    !cafe.isVisible ||
+    !cafe.isActive
+  ) {
     issues.push("This cafe is not available right now");
   } else if (!cafe.isOpen) {
     issues.push("Cafe is currently closed");
   }
 
   const deliveryFee =
-    cart.orderMethod === "delivery" ? (cafe?.deliveryFee ?? 0) : 0;
-  const platformFee = cafe?.platformFee ?? 0;
+    cart.orderMethod === "delivery"
+      ? roundMoney(Math.max(0, Number(cafe?.deliveryFee ?? 0)))
+      : 0;
+  const platformFee = resolvePlatformFee(cafe);
 
   return {
     _id: cart._id,
@@ -230,7 +355,7 @@ const buildView = async (cart: CartDoc | null) => {
       subtotal,
       deliveryFee,
       platformFee,
-      grandTotal: subtotal + deliveryFee + platformFee,
+      grandTotal: roundMoney(subtotal + deliveryFee + platformFee),
     },
     canCheckout: issues.length === 0,
     issues,
@@ -240,16 +365,31 @@ const buildView = async (cart: CartDoc | null) => {
 /* =====================================================
    STUDENT: GET MY CART
 ===================================================== */
-export const getMyCartService = async (studentId: string) => {
-  assertObjectId(studentId, "user ID");
-  return buildView(await findActiveCart(studentId));
+export const getMyCartService = async (
+  studentId: string,
+  legacyUserId?: string,
+) => {
+  assertObjectId(studentId, "student ID");
+  const cart = await Cart.findOne({
+    student: studentIdsFilter(studentId, legacyUserId),
+    status: "active",
+  })
+    .select(
+      "_id cafe items orderMethod paymentMethod deliveryAddress orderNotes totalAmount",
+    )
+    .lean<CartViewInput | null>();
+  return buildView(cart);
 };
 
 /* =====================================================
    STUDENT: ADD ITEM
 ===================================================== */
-export const addToCartService = async (studentId: string, body: unknown) => {
-  assertObjectId(studentId, "user ID");
+export const addToCartService = async (
+  studentId: string,
+  body: unknown,
+  legacyUserId?: string,
+): Promise<Awaited<ReturnType<typeof buildView>>> => {
+  assertObjectId(studentId, "student ID");
 
   const b = asObject(body);
 
@@ -266,58 +406,91 @@ export const addToCartService = async (studentId: string, body: unknown) => {
   if (!menu.isAvailable) throw new ConflictError("This item is not available");
 
   const menuCafeId = menu.cafe as Types.ObjectId;
-  await findOrderableCafe(menuCafeId, { requireOpen: true });
 
-  let cart = await findActiveCart(studentId);
+  return withCartConcurrencyRetry(async () => {
+    const [cafe, existingCart] = await Promise.all([
+      findOrderableCafe(menuCafeId, { requireOpen: true }),
+      findActiveCart(studentId, legacyUserId),
+    ]);
+    let cart = existingCart;
 
-  if (
-    cart &&
-    cart.items.length > 0 &&
-    String(cart.cafe) !== String(menuCafeId)
-  ) {
-    if (!replaceCart) {
+    if (
+      cart &&
+      cart.items.length > 0 &&
+      String(cart.cafe) !== String(menuCafeId)
+    ) {
+      if (!replaceCart) {
+        throw new ConflictError(
+          "Your cart has items from another cafe. Clear it first or send replaceCart=true",
+        );
+      }
+      cart.items.splice(0, cart.items.length);
+    }
+
+    if (!cart) {
+      cart = new Cart({ student: oid(studentId), cafe: menuCafeId, items: [] });
+    } else {
+      cart.student = oid(studentId);
+    }
+    cart.cafe = menuCafeId;
+
+    const line = cart.items.find((i) => String(i.menuItem) === menuItemId);
+    const newQty = (line?.quantity ?? 0) + qty;
+
+    if (newQty > MAX_QTY) {
+      throw new BadRequestError(`You can order at most ${MAX_QTY} of one item`);
+    }
+
+    if (menu.trackStock && newQty > menu.stock) {
       throw new ConflictError(
-        "Your cart has items from another cafe. Clear it first or send replaceCart=true",
+        menu.stock === 0
+          ? "Item is out of stock"
+          : `Only ${menu.stock} left in stock`,
       );
     }
-    cart.items.splice(0, cart.items.length);
-  }
 
-  if (!cart) {
-    cart = new Cart({ student: oid(studentId), cafe: menuCafeId, items: [] });
-  }
-  cart.cafe = menuCafeId;
+    if (line) {
+      line.quantity = newQty;
+      line.price = menu.price;
+      line.name = menu.name;
+    } else {
+      cart.items.push({
+        menuItem: menu._id,
+        name: menu.name,
+        quantity: newQty,
+        price: menu.price,
+      });
+    }
 
-  const line = cart.items.find((i) => String(i.menuItem) === menuItemId);
-  const newQty = (line?.quantity ?? 0) + qty;
+    cart.totalAmount = computeCartTotalAmount(cart.items);
+    await cart.save();
 
-  if (newQty > MAX_QTY) {
-    throw new BadRequestError(`You can order at most ${MAX_QTY} of one item`);
-  }
-
-  if (menu.trackStock && newQty > menu.stock) {
-    throw new ConflictError(
-      menu.stock === 0
-        ? "Item is out of stock"
-        : `Only ${menu.stock} left in stock`,
+    emitCartEvent(
+      {
+        studentId,
+        cartId: String(cart._id),
+        cafeId: String(menuCafeId),
+        itemCount: cart.items.length,
+        totalAmount: cart.totalAmount,
+        action: "item_added",
+      },
+      legacyUserId,
     );
-  }
 
-  if (line) {
-    line.quantity = newQty;
-    line.price = menu.price;
-    line.name = menu.name;
-  } else {
-    cart.items.push({
-      menuItem: menu._id,
-      name: menu.name,
+    logger.debug("[cart] Item added to cart", {
+      studentId,
+      cafeId: String(menuCafeId),
+      menuItemId,
       quantity: newQty,
-      price: menu.price,
+      cartTotal: cart.totalAmount,
+      operation: "CART_ADD_ITEM",
     });
-  }
 
-  await cart.save();
-  return buildView(cart);
+    return buildView(cart, {
+      cafe,
+      menuById: new Map([[String(menu._id), menu]]),
+    });
+  });
 };
 
 /* =====================================================
@@ -328,38 +501,62 @@ export const updateCartItemService = async (
   studentId: string,
   menuItemId: string,
   body: unknown,
+  legacyUserId?: string,
 ) => {
-  assertObjectId(studentId, "user ID");
+  assertObjectId(studentId, "student ID");
   assertObjectId(menuItemId, "menu item ID");
 
   const b = asObject(body);
   const qty = toQuantity(b.quantity, 0);
 
-  const cart = await findActiveCart(studentId);
-  const line = cart?.items.find((i) => String(i.menuItem) === menuItemId);
-  if (!cart || !line) throw new NotFoundError("Item not found in your cart");
+  return withCartConcurrencyRetry(async () => {
+    const cart = await findActiveCart(studentId, legacyUserId);
+    const line = cart?.items.find((i) => String(i.menuItem) === menuItemId);
+    if (!cart || !line) throw new NotFoundError("Item not found in your cart");
 
-  if (qty === 0) {
-    cart.items = cart.items.filter((i) => String(i.menuItem) !== menuItemId);
-  } else {
-    const menu = await MenuItem.findById(menuItemId).lean<MenuLean>();
-    if (!menu || !menu.isAvailable) {
-      throw new ConflictError("This item is no longer available");
-    }
-    if (menu.trackStock && qty > menu.stock) {
-      throw new ConflictError(
-        menu.stock === 0
-          ? "Item is out of stock"
-          : `Only ${menu.stock} left in stock`,
-      );
-    }
-    line.quantity = qty;
-    line.price = menu.price;
-    line.name = menu.name;
-  }
+    cart.student = oid(studentId);
 
-  await cart.save();
-  return buildView(cart);
+    if (qty === 0) {
+      cart.items = cart.items.filter((i) => String(i.menuItem) !== menuItemId);
+    } else {
+      const menu = await MenuItem.findById(menuItemId).lean<MenuLean>();
+      if (!menu || !menu.isAvailable) {
+        throw new ConflictError("This item is no longer available");
+      }
+      if (menu.trackStock && qty > menu.stock) {
+        throw new ConflictError(
+          menu.stock === 0
+            ? "Item is out of stock"
+            : `Only ${menu.stock} left in stock`,
+        );
+      }
+      line.quantity = qty;
+      line.price = menu.price;
+      line.name = menu.name;
+    }
+
+    cart.totalAmount = computeCartTotalAmount(cart.items);
+    await cart.save();
+    emitCartEvent(
+      {
+        studentId,
+        cartId: String(cart._id),
+        cafeId: cart.cafe ? String(cart.cafe) : null,
+        itemCount: cart.items.length,
+        totalAmount: cart.totalAmount,
+        action: qty === 0 ? "item_removed" : "item_updated",
+      },
+      legacyUserId,
+    );
+    logger.debug("[cart] Item quantity updated", {
+      studentId,
+      menuItemId,
+      quantity: qty,
+      cartTotal: cart.totalAmount,
+      operation: "CART_UPDATE_ITEM",
+    });
+    return buildView(cart);
+  });
 };
 
 /* =====================================================
@@ -369,26 +566,64 @@ export const updateCartItemService = async (
 export const removeCartItemService = async (
   studentId: string,
   menuItemId: string,
+  legacyUserId?: string,
 ) => {
-  assertObjectId(studentId, "user ID");
+  assertObjectId(studentId, "student ID");
   assertObjectId(menuItemId, "menu item ID");
 
-  const cart = await findActiveCart(studentId);
-  const exists = cart?.items.some((i) => String(i.menuItem) === menuItemId);
-  if (!cart || !exists) throw new NotFoundError("Item not found in your cart");
+  return withCartConcurrencyRetry(async () => {
+    const cart = await findActiveCart(studentId, legacyUserId);
+    const exists = cart?.items.some((i) => String(i.menuItem) === menuItemId);
+    if (!cart || !exists) throw new NotFoundError("Item not found in your cart");
 
-  cart.items = cart.items.filter((i) => String(i.menuItem) !== menuItemId);
-  await cart.save();
-  return buildView(cart);
+    cart.student = oid(studentId);
+    cart.items = cart.items.filter((i) => String(i.menuItem) !== menuItemId);
+    cart.totalAmount = computeCartTotalAmount(cart.items);
+    await cart.save();
+    emitCartEvent(
+      {
+        studentId,
+        cartId: String(cart._id),
+        cafeId: cart.cafe ? String(cart.cafe) : null,
+        itemCount: cart.items.length,
+        totalAmount: cart.totalAmount,
+        action: "item_removed",
+      },
+      legacyUserId,
+    );
+    logger.debug("[cart] Item removed from cart", {
+      studentId,
+      menuItemId,
+      cartTotal: cart.totalAmount,
+      operation: "CART_REMOVE_ITEM",
+    });
+    return buildView(cart);
+  });
 };
 
 /* =====================================================
    STUDENT: CLEAR CART
    - Allowed even if the cafe is closed
 ===================================================== */
-export const clearCartService = async (studentId: string) => {
-  assertObjectId(studentId, "user ID");
-  await Cart.deleteOne({ student: oid(studentId), status: "active" });
+export const clearCartService = async (
+  studentId: string,
+  legacyUserId?: string,
+) => {
+  assertObjectId(studentId, "student ID");
+  await Cart.deleteMany({
+    student: studentIdsFilter(studentId, legacyUserId),
+    status: "active",
+  });
+  emitCartEvent(
+    {
+      studentId,
+      cafeId: null,
+      itemCount: 0,
+      totalAmount: 0,
+      action: "cleared",
+    },
+    legacyUserId,
+  );
   return buildView(null);
 };
 
@@ -398,75 +633,102 @@ export const clearCartService = async (studentId: string) => {
 export const updateCartOptionsService = async (
   studentId: string,
   body: unknown,
+  legacyUserId?: string,
 ) => {
-  assertObjectId(studentId, "user ID");
+  assertObjectId(studentId, "student ID");
 
   const b = asObject(body);
 
-  const cart = await findActiveCart(studentId);
-  if (!cart || cart.items.length === 0) {
-    throw new NotFoundError("Your cart is empty");
-  }
+  return withCartConcurrencyRetry(async () => {
+    const cart = await findActiveCart(studentId, legacyUserId);
+    if (!cart || cart.items.length === 0) {
+      throw new NotFoundError("Your cart is empty");
+    }
 
-  const cafe = await findOrderableCafe(cart.cafe as Types.ObjectId, {
-    requireOpen: true,
+    cart.student = oid(studentId);
+
+    const cafe = await findOrderableCafe(cart.cafe as Types.ObjectId, {
+      requireOpen: true,
+    });
+
+    if (b.orderMethod !== undefined) {
+      const method = b.orderMethod;
+      if (method !== "delivery" && method !== "self_pickup") {
+        throw new BadRequestError("orderMethod must be delivery or self_pickup");
+      }
+      if (method === "delivery" && !cafe.deliveryEnabled) {
+        throw new ConflictError("This cafe does not offer delivery");
+      }
+      if (method === "self_pickup" && !cafe.pickupEnabled) {
+        throw new ConflictError("This cafe does not offer self pickup");
+      }
+      cart.orderMethod = method;
+    }
+
+    if (b.paymentMethod !== undefined) {
+      const pm = b.paymentMethod;
+      if (pm !== "online" && pm !== "cash") {
+        throw new BadRequestError("paymentMethod must be online or cash");
+      }
+      cart.paymentMethod = pm;
+    }
+
+    if (b.orderNotes !== undefined) {
+      const notes = str(b.orderNotes);
+      if (notes.length > 300)
+        throw new BadRequestError("orderNotes max 300 characters");
+      cart.orderNotes = notes || undefined;
+    }
+
+    if (b.deliveryAddress !== undefined) {
+      const a = asObject(b.deliveryAddress);
+
+      const address = {
+        hostel: str(a.hostel) || undefined,
+        block: str(a.block) || undefined,
+        roomNumber: str(a.roomNumber) || undefined,
+        landmark: str(a.landmark) || undefined,
+        phone: str(a.phone) || undefined,
+      };
+
+      for (const [k, val] of [
+        ["hostel", address.hostel],
+        ["block", address.block],
+        ["roomNumber", address.roomNumber],
+        ["landmark", address.landmark],
+      ] as const) {
+        if (val && val.length > 120) {
+          throw new BadRequestError(`${k} must not exceed 120 characters`);
+        }
+      }
+
+      if (address.phone && !PHONE.test(address.phone)) {
+        throw new BadRequestError("Valid 10 digit phone is required");
+      }
+      cart.deliveryAddress = address;
+    }
+
+    if (cart.orderMethod === "delivery") {
+      const a = cart.deliveryAddress;
+      if (!a?.hostel || !a?.roomNumber || !a?.phone) {
+        throw new BadRequestError(
+          "Delivery needs deliveryAddress with hostel, roomNumber and phone",
+        );
+      }
+    }
+
+    await cart.save();
+    emitCartEvent(
+      {
+        studentId,
+        cartId: String(cart._id),
+        cafeId: cart.cafe ? String(cart.cafe) : null,
+        itemCount: cart.items.length,
+        totalAmount: cart.totalAmount,
+        action: "options_updated",
+      },
+      legacyUserId,
+    );
+    return buildView(cart);
   });
-
-  if (b.orderMethod !== undefined) {
-    const method = b.orderMethod;
-    if (method !== "delivery" && method !== "self_pickup") {
-      throw new BadRequestError("orderMethod must be delivery or self_pickup");
-    }
-    if (method === "delivery" && !cafe.deliveryEnabled) {
-      throw new ConflictError("This cafe does not offer delivery");
-    }
-    if (method === "self_pickup" && !cafe.pickupEnabled) {
-      throw new ConflictError("This cafe does not offer self pickup");
-    }
-    cart.orderMethod = method;
-  }
-
-  if (b.paymentMethod !== undefined) {
-    const pm = b.paymentMethod;
-    if (pm !== "online" && pm !== "cash") {
-      throw new BadRequestError("paymentMethod must be online or cash");
-    }
-    cart.paymentMethod = pm;
-  }
-
-  if (b.orderNotes !== undefined) {
-    const notes = str(b.orderNotes);
-    if (notes.length > 300)
-      throw new BadRequestError("orderNotes max 300 characters");
-    cart.orderNotes = notes || undefined;
-  }
-
-  if (b.deliveryAddress !== undefined) {
-    const a = asObject(b.deliveryAddress);
-
-    const address = {
-      hostel: str(a.hostel) || undefined,
-      block: str(a.block) || undefined,
-      roomNumber: str(a.roomNumber) || undefined,
-      landmark: str(a.landmark) || undefined,
-      phone: str(a.phone) || undefined,
-    };
-
-    if (address.phone && !PHONE.test(address.phone)) {
-      throw new BadRequestError("Valid 10 digit phone is required");
-    }
-    cart.deliveryAddress = address;
-  }
-
-  if (cart.orderMethod === "delivery") {
-    const a = cart.deliveryAddress;
-    if (!a?.hostel || !a?.roomNumber || !a?.phone) {
-      throw new BadRequestError(
-        "Delivery needs deliveryAddress with hostel, roomNumber and phone",
-      );
-    }
-  }
-
-  await cart.save();
-  return buildView(cart);
 };

@@ -3,12 +3,17 @@ import {
   authenticate,
   authorize,
 } from "../../middlewares/authenticate.middleware.js";
+import {
+  adminMutationLimiter,
+  adminReadLimiter,
+} from "../../middlewares/rateLimiter.middleware.js";
 
 import {
   getDashboardOverview,
   getAllUsers,
   getUserDetail,
   setUserActive,
+  adminForceLogoutUser,
   getAllOrders,
   getOrderDetail,
   getAllPayments,
@@ -49,13 +54,6 @@ const router = Router();
  *       schema: { type: string, format: date, example: "2026-10-31" }
  *       description: End date (inclusive)
  *   schemas:
- *     Pagination:
- *       type: object
- *       properties:
- *         total: { type: integer, example: 120 }
- *         page: { type: integer, example: 1 }
- *         limit: { type: integer, example: 10 }
- *         totalPages: { type: integer, example: 12 }
  *     AdminUser:
  *       type: object
  *       properties:
@@ -124,7 +122,7 @@ router.use(authenticate, authorize("admin"));
  *       401: { description: Unauthorized }
  *       403: { description: Forbidden (admin only) }
  */
-router.get("/dashboard", getDashboardOverview);
+router.get("/dashboard", adminReadLimiter, getDashboardOverview);
 
 /* =========================================================
    USERS
@@ -167,12 +165,12 @@ router.get("/dashboard", getDashboardOverview);
  *                     users:
  *                       type: array
  *                       items: { $ref: '#/components/schemas/AdminUser' }
- *                     pagination: { $ref: '#/components/schemas/Pagination' }
+ *                     pagination: { $ref: '#/components/schemas/PagePagination' }
  *       400: { description: Invalid query parameter }
  *       401: { description: Unauthorized }
  *       403: { description: Forbidden }
  */
-router.get("/users", getAllUsers);
+router.get("/users", adminReadLimiter, getAllUsers);
 
 /**
  * @swagger
@@ -215,7 +213,7 @@ router.get("/users", getAllUsers);
  *       400: { description: Invalid user ID }
  *       404: { description: User not found }
  */
-router.get("/users/:userId", getUserDetail);
+router.get("/users/:userId", adminReadLimiter, getUserDetail);
 
 /**
  * @swagger
@@ -254,7 +252,41 @@ router.get("/users/:userId", getUserDetail);
  *       400: { description: Validation error }
  *       404: { description: User not found }
  */
-router.patch("/users/:userId/status", setUserActive);
+router.patch("/users/:userId/status", adminMutationLimiter, setUserActive);
+
+/**
+ * @swagger
+ * /admin/users/{userId}/revoke-sessions:
+ *   post:
+ *     summary: Force-revoke all active sessions for a user
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: User sessions revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: User sessions revoked successfully }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     revokedSessions: { type: integer, example: 2 }
+ *       400: { $ref: '#/components/responses/BadRequest' }
+ *       401: { $ref: '#/components/responses/Unauthorized' }
+ *       403: { $ref: '#/components/responses/Forbidden' }
+ *       404: { $ref: '#/components/responses/NotFound' }
+ */
+router.post("/users/:userId/revoke-sessions", adminMutationLimiter, adminForceLogoutUser);
 
 /* =========================================================
    ORDERS
@@ -315,10 +347,10 @@ router.patch("/users/:userId/status", setUserActive);
  *                     orders:
  *                       type: array
  *                       items: { type: object }
- *                     pagination: { $ref: '#/components/schemas/Pagination' }
+ *                     pagination: { $ref: '#/components/schemas/PagePagination' }
  *       400: { description: Invalid query parameter }
  */
-router.get("/orders", getAllOrders);
+router.get("/orders", adminReadLimiter, getAllOrders);
 
 /**
  * @swagger
@@ -349,7 +381,7 @@ router.get("/orders", getAllOrders);
  *       400: { description: Invalid order ID }
  *       404: { description: Order not found }
  */
-router.get("/orders/:orderId", getOrderDetail);
+router.get("/orders/:orderId", adminReadLimiter, getOrderDetail);
 
 /* =========================================================
    PAYMENTS
@@ -412,10 +444,10 @@ router.get("/orders/:orderId", getOrderDetail);
  *                     payments:
  *                       type: array
  *                       items: { type: object }
- *                     pagination: { $ref: '#/components/schemas/Pagination' }
+ *                     pagination: { $ref: '#/components/schemas/PagePagination' }
  *       400: { description: Invalid query parameter }
  */
-router.get("/payments", getAllPayments);
+router.get("/payments", adminReadLimiter, getAllPayments);
 
 /**
  * @swagger
@@ -444,7 +476,7 @@ router.get("/payments", getAllPayments);
  *                 data: { type: object }
  *       404: { description: Payment not found }
  */
-router.get("/payments/:paymentId", getPaymentDetail);
+router.get("/payments/:paymentId", adminReadLimiter, getPaymentDetail);
 
 /* =========================================================
    ADMIN PROFILE
@@ -500,8 +532,8 @@ router.get("/payments/:paymentId", getPaymentDetail);
  *       400: { description: Validation error / Nothing to update }
  *       404: { description: Admin not found }
  */
-router.get("/profile", getAdminProfile);
-router.patch("/profile", updateAdminProfile);
+router.get("/profile", adminReadLimiter, getAdminProfile);
+router.patch("/profile", adminMutationLimiter, updateAdminProfile);
 
 /**
  * @swagger
@@ -531,6 +563,6 @@ router.patch("/profile", updateAdminProfile);
  *       400: { description: Validation error / Current password galat hai }
  *       404: { description: Admin not found }
  */
-router.patch("/change-password", changeAdminPassword);
+router.patch("/change-password", adminMutationLimiter, changeAdminPassword);
 
 export default router;

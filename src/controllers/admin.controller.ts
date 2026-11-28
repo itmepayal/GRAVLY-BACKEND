@@ -7,6 +7,7 @@ import {
   getAllUsersService,
   getUserDetailService,
   setUserActiveService,
+  adminForceLogoutService,
   getAllOrdersService,
   getOrderDetailService,
   getAllPaymentsService,
@@ -154,6 +155,22 @@ export const setUserActive = asyncHandler(async (req, res) => {
       : "User deactivated successfully",
     result,
   );
+});
+
+/**
+ * POST /admin/users/:userId/revoke-sessions
+ */
+export const adminForceLogoutUser = asyncHandler(async (req, res) => {
+  const userId = getRequiredParam(req, "userId");
+  const requestId = (req as Request & { requestId?: string }).requestId;
+
+  const result = await adminForceLogoutService(
+    userId,
+    getAdminId(req),
+    requestId,
+  );
+
+  sendSuccess(res, "User sessions revoked successfully", result);
 });
 
 /* =========================================================
